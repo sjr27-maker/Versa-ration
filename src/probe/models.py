@@ -74,3 +74,31 @@ class Hypothesis(BaseModel):
                     f"refs; ref {ref.id} has polarity={ref.polarity.value}"
                 )
         return refs
+
+
+class CandidateAction(BaseModel):
+    """A candidate action the loop could take next.
+
+    `kind` differentiates action types (currently only 'teach'). `payload`
+    stays loose while the action space is still evolving — the real
+    action ontology lands in Step 3.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    kind: str
+    payload: dict = Field(default_factory=dict)
+
+
+class ProposedEvidence(BaseModel):
+    """The Infer→Update handoff.
+
+    Infer decides which existing hypothesis a turn bears on, what new
+    probability/confidence to assign, and provides the underlying
+    EvidenceRef. Update consumes these to call
+    `HypothesisStore.reweight(...)`.
+    """
+
+    hypothesis_id: UUID
+    new_probability: float = Field(ge=0.0, le=1.0)
+    new_confidence: float = Field(ge=0.0, le=1.0)
+    evidence_ref: EvidenceRef

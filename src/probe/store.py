@@ -61,6 +61,36 @@ class HypothesisStore:
             )
         return self._row_to_hypothesis(row, ev_rows)
 
+    async def list_all(self, tier: Tier | None = None) -> list[Hypothesis]:
+        async with self._pool.acquire() as conn:
+            if tier is None:
+                rows = await conn.fetch(
+                    "SELECT * FROM hypotheses ORDER BY created_at, id"
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM hypotheses
+                    WHERE tier = $1
+                    ORDER BY created_at, id
+                    """,
+                    tier.value,
+                )
+            ids = [r["id"] for r in rows]
+            ev_by_hyp: dict[UUID, list] = {hid: [] for hid in ids}
+            if ids:
+                ev_rows = await conn.fetch(
+                    """
+                    SELECT * FROM evidence_refs
+                    WHERE hypothesis_id = ANY($1::uuid[])
+                    ORDER BY timestamp, id
+                    """,
+                    ids,
+                )
+                for ev in ev_rows:
+                    ev_by_hyp[ev["hypothesis_id"]].append(ev)
+        return [self._row_to_hypothesis(row, ev_by_hyp[row["id"]]) for row in rows]
+
     async def list_by_layer(
         self, layer: Layer, tier: Tier | None = None
     ) -> list[Hypothesis]:

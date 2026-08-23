@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import asyncpg
 import pytest
 from pydantic import ValidationError
 
@@ -44,8 +45,11 @@ async def test_create_and_retrieve(store):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_reweight_appends_evidence_rather_than_overwriting(store):
-    turn_a, turn_b, turn_c = uuid4(), uuid4(), uuid4()
+async def test_reweight_appends_evidence_rather_than_overwriting(store, transcript):
+    session_id = await transcript.create_session()
+    turn_a = await transcript.record_turn(session_id, 0, "turn a")
+    turn_b = await transcript.record_turn(session_id, 1, "turn b")
+    turn_c = await transcript.record_turn(session_id, 2, "turn c")
     initial_evidence = EvidenceRef(
         turn_id=turn_a,
         polarity=Polarity.SUPPORTING,
@@ -105,6 +109,30 @@ async def test_archived_hypothesis_can_be_resurrected(store):
 
     active_list = await store.list_by_layer(hyp.layer, tier=Tier.ACTIVE)
     assert [h.id for h in active_list] == [hyp.id]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_reweight_rejects_evidence_ref_with_nonexistent_turn_id(store):
+    hyp = _make_hypothesis()
+    await store.add(hyp)
+
+    orphan_turn_id = uuid4()
+    orphan_ref = EvidenceRef(
+        turn_id=orphan_turn_id,
+        polarity=Polarity.SUPPORTING,
+        timestamp=datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await store.reweight(hyp.id, 0.7, 0.5, orphan_ref)
+
+    # And the reweight transaction rolled back — probability/confidence
+    # unchanged, no partial evidence row appended.
+    reloaded = await store.get(hyp.id)
+    assert reloaded.probability == pytest.approx(hyp.probability)
+    assert reloaded.confidence == pytest.approx(hyp.confidence)
+    assert reloaded.evidence_refs == []
+    assert reloaded.counter_evidence_refs == []
 
 
 def test_evidence_refs_rejects_contradicting_polarity():
