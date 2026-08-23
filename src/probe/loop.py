@@ -30,6 +30,7 @@ from probe.nodes import (
     Update,
 )
 from probe.store import HypothesisStore
+from probe.value_function import ValueFunction, ValueFunctionConfig
 
 
 class SessionLoop:
@@ -39,12 +40,14 @@ class SessionLoop:
         transcript: TranscriptStore,
         node_calls: NodeCallStore,
         llm: LLMClient,
+        value_function_config: ValueFunctionConfig | None = None,
     ) -> None:
         self._hyp = hypothesis_store
         self._transcript = transcript
         self._node_calls = node_calls
+        self.value_function = ValueFunction(llm, value_function_config)
         self.infer = Infer(llm)
-        self.plan = Plan()
+        self.plan = Plan(self.value_function)
         self.teach = Teach(llm)
         self.test = Test()
         self.diagnose = Diagnose()
@@ -105,19 +108,20 @@ class SessionLoop:
             hypotheses=refreshed_hypotheses,
         )
 
-        candidates = await self._call_node(
+        plan_output = await self._call_node(
             self.plan,
             session_id,
             turn_index,
             hypotheses=refreshed_hypotheses,
             concept_state={},
+            generation_width=self._generation_width,
         )
 
         message = await self._call_node(
             self.teach,
             session_id,
             turn_index,
-            action=candidates[0],
+            action=plan_output.winner,
         )
 
         return message

@@ -17,13 +17,17 @@ import math
 
 from probe.llm import LLMClient
 from probe.models import (
+    ActionScore,
     CandidateAction,
     EvidenceRef,
     Hypothesis,
+    PlanOutput,
     ProposedEvidence,
+    TeachingAction,
     Tier,
 )
 from probe.store import HypothesisStore
+from probe.value_function import ValueFunction
 
 DEFAULT_GENERATION_WIDTH = 3
 _MIN_WIDTH = 1
@@ -72,23 +76,49 @@ class Infer:
 
 
 class Plan:
+    """Generate N candidate actions, score each, return the winner + scores.
+
+    Candidate generation is deterministic first-N-of-enum for now. When
+    the LLM-driven candidate proposer lands, only the `_generate` method
+    changes; scoring and selection stay identical.
+
+    The returned `PlanOutput` carries both the winner (for Teach) and
+    the full per-candidate `ActionScore` breakdown. Both survive
+    together through the SessionLoop audit choke point (CLAUDE.md
+    invariant 2) so ablation runs can inspect every candidate's terms,
+    not just the winner's.
+    """
+
+    def __init__(self, value_function: ValueFunction) -> None:
+        self._vf = value_function
+
     async def run(
-        self, hypotheses: list[Hypothesis], concept_state: dict
+        self,
+        hypotheses: list[Hypothesis],
+        concept_state: dict,
+        generation_width: int,
+    ) -> PlanOutput:
+        candidates = self._generate(generation_width, concept_state)
+        scores: list[ActionScore] = []
+        for candidate in candidates:
+            scores.append(await self._vf.score(candidate, hypotheses, concept_state))
+        winner_score = max(scores, key=lambda s: s.total)
+        return PlanOutput(winner=winner_score.candidate, scores=scores)
+
+    def _generate(
+        self, n: int, concept_state: dict
     ) -> list[CandidateAction]:
-        # Step 3 will replace this with the real action space + value fn.
+        target = None
+        if isinstance(concept_state, dict):
+            target = concept_state.get("target_concept")
+        actions = list(TeachingAction)[: max(1, n)]
         return [
             CandidateAction(
-                kind="teach",
-                payload={"concept": "recursion", "approach": "worked-example"},
-            ),
-            CandidateAction(
-                kind="teach",
-                payload={"concept": "recursion", "approach": "socratic-question"},
-            ),
-            CandidateAction(
-                kind="teach",
-                payload={"concept": "recursion", "approach": "analogy"},
-            ),
+                action=a,
+                target_concept=target,
+                rationale=f"stub: first-{len(actions)} enum generation",
+            )
+            for a in actions
         ]
 
 
@@ -97,7 +127,16 @@ class Teach:
         self._llm = llm
 
     async def run(self, action: CandidateAction) -> str:
-        prompt = f"TEACH: kind={action.kind} payload={json.dumps(action.payload)}"
+        prompt = (
+            "TEACH: "
+            + json.dumps(
+                {
+                    "action": action.action.value,
+                    "target_concept": action.target_concept,
+                    "rationale": action.rationale,
+                }
+            )
+        )
         return await self._llm.complete(prompt)
 
 

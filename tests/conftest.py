@@ -31,11 +31,11 @@ async def pool():
         # Fresh schema for the test session. DROP is DDL cleanup here in
         # tests only — the stores themselves must never remove rows
         # (CLAUDE.md invariants 1 and 2).
-        await conn.execute("DROP TABLE IF EXISTS node_calls")
-        await conn.execute("DROP TABLE IF EXISTS turns")
-        await conn.execute("DROP TABLE IF EXISTS sessions")
-        await conn.execute("DROP TABLE IF EXISTS evidence_refs")
-        await conn.execute("DROP TABLE IF EXISTS hypotheses")
+        await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS evidence_refs CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS turns CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS sessions CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS hypotheses CASCADE")
         await conn.execute("DROP TYPE IF EXISTS evidence_polarity")
         await conn.execute("DROP TYPE IF EXISTS hypothesis_tier")
         await conn.execute("DROP TYPE IF EXISTS hypothesis_layer")

@@ -76,17 +76,77 @@ class Hypothesis(BaseModel):
         return refs
 
 
-class CandidateAction(BaseModel):
-    """A candidate action the loop could take next.
+class TeachingAction(str, Enum):
+    """The full teaching-action space. Exactly 21 members.
 
-    `kind` differentiates action types (currently only 'teach'). `payload`
-    stays loose while the action space is still evolving — the real
-    action ontology lands in Step 3.
+    Ordering here doubles as Plan's default candidate-generation order
+    when it's asked for N < 21. Nothing else in the codebase should
+    depend on this ordering — QUIZ (position 3) is not special.
     """
 
+    EXPLAIN = "explain"
+    ASK = "ask"
+    QUIZ = "quiz"
+    EXAMPLE = "example"
+    COUNTEREXAMPLE = "counterexample"
+    ANALOGY = "analogy"
+    VISUALIZE = "visualize"
+    SIMULATE = "simulate"
+    DERIVE = "derive"
+    DECOMPOSE = "decompose"
+    COMPARE = "compare"
+    REPHRASE = "rephrase"
+    CHALLENGE = "challenge"
+    RECALL = "recall"
+    APPLY = "apply"
+    TEACH_BACK = "teach_back"
+    CONNECT = "connect"
+    CORRECT_MISCONCEPTION = "correct_misconception"
+    SLOW_DOWN = "slow_down"
+    INCREASE_DIFFICULTY = "increase_difficulty"
+    CHANGE_REPRESENTATION = "change_representation"
+
+
+class CandidateAction(BaseModel):
+    """A candidate action the loop could take next."""
+
     id: UUID = Field(default_factory=uuid4)
-    kind: str
-    payload: dict = Field(default_factory=dict)
+    action: TeachingAction
+    target_concept: str | None = None
+    rationale: str = ""
+
+
+class ActionScore(BaseModel):
+    """Full six-term value-function breakdown for one candidate action.
+
+    Every ablation-relevant term stays visible even when disabled (its
+    value will be 0.0). `total` is the raw sum used for ranking; the
+    per-term fields are what the ablation dashboard reads. Do not
+    collapse this to a single float — CLAUDE.md invariant 3.
+    """
+
+    candidate: CandidateAction
+    learning_value: float
+    information_value: float
+    long_term_value: float
+    time_cost: float
+    cognitive_cost: float
+    frustration_risk: float
+    total: float
+    information_value_call_count: int = 0
+
+
+class PlanOutput(BaseModel):
+    """Plan's return value.
+
+    Carries both the winning action (for Teach to render) and the full
+    per-candidate score breakdown (for the audit trail). Both survive
+    together through `SessionLoop._call_node`'s serialization into
+    `node_calls.output_json`.
+    """
+
+    winner: CandidateAction
+    scores: list[ActionScore]
 
 
 class ProposedEvidence(BaseModel):

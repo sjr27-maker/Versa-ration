@@ -41,3 +41,18 @@ Do not call `node.run(...)` from production code paths outside the loop.
 Why: the audit trail is the product. If a node executed and we don't
 have its inputs+outputs on disk, we can't reconstruct how a belief
 changed — which defeats the point of building probe in the first place.
+
+### 3. Value-function terms are individually disable-able
+
+Every term in the `ValueFunction` (learning_value, information_value,
+long_term_value, time_cost, cognitive_cost, frustration_risk) must be
+independently toggle-able via `ValueFunctionConfig` without any code
+changes. A disabled term contributes 0 to `score()` and skips its LLM
+calls entirely. The full six-term breakdown must survive on every
+`ActionScore` even when some terms are zero, so ablation runs are
+comparable side-by-side in `node_calls`.
+
+Why: this codebase is a research artifact whose main question is which
+terms actually matter. If turning one off requires editing code, we
+can't run apples-to-apples ablations. Keep the config knob, keep the
+breakdown, don't collapse to a single float.
