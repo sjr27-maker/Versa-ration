@@ -79,3 +79,29 @@ holds an FK to `concept_nodes.id`. Removing a concept out from under it
 would either orphan overlay rows or require a cascade that silently
 destroys learner state. `ON DELETE RESTRICT` on that FK enforces this at
 the schema level; no delete method enforces it at the code level.
+
+### 5. World-model revisions are append-only
+
+`WorldModelRevisionStore` must never delete rows. Concretely:
+
+- No `delete` / `remove` methods on the class.
+- No `DELETE` SQL anywhere in the `revision` module or its migrations.
+- Resolution is modeled by moving a revision's `status` from `pending`
+  to `approved` or `rejected` via UPDATE, not by removing it. A
+  rejected revision stays on record as a rejected claim, not as if it
+  had never been proposed.
+- `approve()` never overwrites `proposed_change` — it records the
+  human-confirmed structured edit separately, as
+  `applied_field_updates`, on the same row. The original free-text
+  claim and the edit that was actually applied both remain visible.
+
+This is a separate invariant from #1 and #4, not a restatement of
+either: the rationale is again distinct, so it gets its own entry.
+
+Why: a `WorldModelRevision` is a claim about the concept graph, evidence-
+backed the same way a `Hypothesis` is a claim about the learner — and
+probe's premise (invariant 1) is auditing how *all* beliefs evolved, not
+just learner-facing ones. Deleting a resolved revision would erase the
+record of what was proposed, what a human decided about it, and why —
+exactly the trail that makes a rejected-but-plausible claim or an
+approved edit's justification recoverable later.

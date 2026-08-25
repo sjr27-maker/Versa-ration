@@ -129,6 +129,128 @@ class HypothesisStore:
                     ev_by_hyp[ev["hypothesis_id"]].append(ev)
         return [self._row_to_hypothesis(row, ev_by_hyp[row["id"]]) for row in rows]
 
+    async def link_concept(
+        self, hypothesis_id: UUID, concept_graph_id: UUID, concept_id: str
+    ) -> None:
+        """Assert that a hypothesis pertains to a concept.
+
+        Idempotent — linking the same (hypothesis_id, concept_graph_id,
+        concept_id) triple twice is a no-op, not a duplicate row. This
+        is the matching convention `MismatchDetector`/`Diagnose` rely on
+        to find "the mental_model hypothesis for this concept": a
+        separate join table rather than a field on `Hypothesis`, since a
+        hypothesis can pertain to zero, one, or several concepts.
+        concept_id is only unique within its concept_graph_id.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO hypothesis_concepts (
+                    hypothesis_id, concept_graph_id, concept_id
+                ) VALUES ($1, $2, $3)
+                ON CONFLICT DO NOTHING
+                """,
+                hypothesis_id,
+                concept_graph_id,
+                concept_id,
+            )
+
+    async def list_by_concept(
+        self,
+        concept_graph_id: UUID,
+        concept_id: str,
+        layer: Layer | None = None,
+        tier: Tier | None = None,
+    ) -> list[Hypothesis]:
+        conditions = ["hc.concept_graph_id = $1", "hc.concept_id = $2"]
+        params: list = [concept_graph_id, concept_id]
+        if layer is not None:
+            params.append(layer.value)
+            conditions.append(f"h.layer = ${len(params)}")
+        if tier is not None:
+            params.append(tier.value)
+            conditions.append(f"h.tier = ${len(params)}")
+        where = " AND ".join(conditions)
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT h.* FROM hypotheses h
+                JOIN hypothesis_concepts hc ON hc.hypothesis_id = h.id
+                WHERE {where}
+                ORDER BY h.created_at, h.id
+                """,
+                *params,
+            )
+            ids = [r["id"] for r in rows]
+            ev_by_hyp: dict[UUID, list] = {hid: [] for hid in ids}
+            if ids:
+                ev_rows = await conn.fetch(
+                    """
+                    SELECT * FROM evidence_refs
+                    WHERE hypothesis_id = ANY($1::uuid[])
+                    ORDER BY timestamp, id
+                    """,
+                    ids,
+                )
+                for ev in ev_rows:
+                    ev_by_hyp[ev["hypothesis_id"]].append(ev)
+        return [self._row_to_hypothesis(row, ev_by_hyp[row["id"]]) for row in rows]
+
+    async def list_by_learner(
+        self,
+        learner_id: UUID,
+        layer: Layer | None = None,
+        tier: Tier | None = None,
+    ) -> list[Hypothesis]:
+        """Hypotheses with at least one evidence_ref traceable to this
+        learner's sessions (evidence_ref -> turn -> session -> learner_id).
+
+        Hypothesis has no direct learner_id column — same reasoning as
+        `hypothesis_concepts` being a join table rather than a field on
+        Hypothesis: this avoids a migration on the already-shipped
+        model. This is the best signal available today, and it has a
+        real limitation: a hypothesis with no evidence yet (freshly
+        added, never reweighted) has no learner association and won't
+        appear here.
+        """
+        conditions = ["s.learner_id = $1"]
+        params: list = [learner_id]
+        if layer is not None:
+            params.append(layer.value)
+            conditions.append(f"h.layer = ${len(params)}")
+        if tier is not None:
+            params.append(tier.value)
+            conditions.append(f"h.tier = ${len(params)}")
+        where = " AND ".join(conditions)
+
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"""
+                SELECT DISTINCT h.* FROM hypotheses h
+                JOIN evidence_refs er ON er.hypothesis_id = h.id
+                JOIN turns t ON t.id = er.turn_id
+                JOIN sessions s ON s.id = t.session_id
+                WHERE {where}
+                ORDER BY h.created_at, h.id
+                """,
+                *params,
+            )
+            ids = [r["id"] for r in rows]
+            ev_by_hyp: dict[UUID, list] = {hid: [] for hid in ids}
+            if ids:
+                ev_rows = await conn.fetch(
+                    """
+                    SELECT * FROM evidence_refs
+                    WHERE hypothesis_id = ANY($1::uuid[])
+                    ORDER BY timestamp, id
+                    """,
+                    ids,
+                )
+                for ev in ev_rows:
+                    ev_by_hyp[ev["hypothesis_id"]].append(ev)
+        return [self._row_to_hypothesis(row, ev_by_hyp[row["id"]]) for row in rows]
+
     async def reweight(
         self,
         id: UUID,

@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from probe import store as store_module
-from probe.models import EvidenceRef, Hypothesis, Layer, Polarity, Tier
+from probe.models import ConceptNode, EvidenceRef, Hypothesis, Layer, Polarity, Tier
 
 
 def _make_hypothesis(**overrides) -> Hypothesis:
@@ -45,8 +45,10 @@ async def test_create_and_retrieve(store):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_reweight_appends_evidence_rather_than_overwriting(store, transcript):
-    session_id = await transcript.create_session()
+async def test_reweight_appends_evidence_rather_than_overwriting(
+    store, transcript, learner_id, concept_graph_id
+):
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
     turn_a = await transcript.record_turn(session_id, 0, "turn a")
     turn_b = await transcript.record_turn(session_id, 1, "turn b")
     turn_c = await transcript.record_turn(session_id, 2, "turn c")
@@ -156,6 +158,57 @@ def test_counter_evidence_refs_rejects_supporting_polarity():
         match="counter_evidence_refs must contain only CONTRADICTING",
     ):
         _make_hypothesis(counter_evidence_refs=[supporting])
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_list_by_concept_filters_via_the_join_table(
+    store, concept_graph, concept_graph_id
+):
+    await concept_graph.add_concept(
+        ConceptNode(concept_graph_id=concept_graph_id, id="closures", name="Closures")
+    )
+    await concept_graph.add_concept(
+        ConceptNode(concept_graph_id=concept_graph_id, id="loops", name="Loops")
+    )
+
+    linked = _make_hypothesis(layer=Layer.MENTAL_MODEL)
+    unlinked = _make_hypothesis(layer=Layer.MENTAL_MODEL)
+    other_layer = _make_hypothesis(layer=Layer.KNOWLEDGE)
+    await store.add(linked)
+    await store.add(unlinked)
+    await store.add(other_layer)
+
+    await store.link_concept(linked.id, concept_graph_id, "closures")
+    await store.link_concept(other_layer.id, concept_graph_id, "closures")
+    await store.link_concept(unlinked.id, concept_graph_id, "loops")
+
+    mental_model_for_closures = await store.list_by_concept(
+        concept_graph_id, "closures", layer=Layer.MENTAL_MODEL, tier=Tier.ACTIVE
+    )
+    assert [h.id for h in mental_model_for_closures] == [linked.id]
+
+    all_for_closures = await store.list_by_concept(concept_graph_id, "closures")
+    assert {h.id for h in all_for_closures} == {linked.id, other_layer.id}
+
+    for_loops = await store.list_by_concept(
+        concept_graph_id, "loops", layer=Layer.MENTAL_MODEL
+    )
+    assert [h.id for h in for_loops] == [unlinked.id]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_link_concept_is_idempotent(store, concept_graph, concept_graph_id):
+    await concept_graph.add_concept(
+        ConceptNode(concept_graph_id=concept_graph_id, id="closures", name="Closures")
+    )
+    hyp = _make_hypothesis(layer=Layer.MENTAL_MODEL)
+    await store.add(hyp)
+
+    await store.link_concept(hyp.id, concept_graph_id, "closures")
+    await store.link_concept(hyp.id, concept_graph_id, "closures")  # must not duplicate
+
+    result = await store.list_by_concept(concept_graph_id, "closures")
+    assert [h.id for h in result] == [hyp.id]
 
 
 def test_store_module_has_no_delete():

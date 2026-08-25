@@ -8,15 +8,26 @@ from probe.nodes import DEFAULT_GENERATION_WIDTH, Replan
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_replan_records_a_node_call_every_turn(
-    store, transcript, node_calls, clean_pool
+    store,
+    transcript,
+    node_calls,
+    clean_pool,
+    learner_id,
+    concept_graph_id,
+    concept_graph,
+    learner_overlay,
+    revision_store,
 ):
     loop = SessionLoop(
         hypothesis_store=store,
         transcript=transcript,
         node_calls=node_calls,
+        concept_graph=concept_graph,
+        learner_overlay=learner_overlay,
+        revision_store=revision_store,
         llm=StubLLMClient(),
     )
-    session_id = await transcript.create_session()
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
 
     for i in range(3):
         await loop.handle_turn(session_id, i, f"turn {i} from student")
@@ -40,7 +51,15 @@ async def test_replan_records_a_node_call_every_turn(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_replan_output_threads_into_next_turn_infer_input(
-    store, transcript, node_calls, clean_pool
+    store,
+    transcript,
+    node_calls,
+    clean_pool,
+    learner_id,
+    concept_graph_id,
+    concept_graph,
+    learner_overlay,
+    revision_store,
 ):
     # Seed a hypothesis at p=0.5 so Replan's entropy computation is
     # non-trivial and > DEFAULT_GENERATION_WIDTH on turn 0.
@@ -59,9 +78,12 @@ async def test_replan_output_threads_into_next_turn_infer_input(
         hypothesis_store=store,
         transcript=transcript,
         node_calls=node_calls,
+        concept_graph=concept_graph,
+        learner_overlay=learner_overlay,
+        revision_store=revision_store,
         llm=StubLLMClient(),
     )
-    session_id = await transcript.create_session()
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
 
     await loop.handle_turn(session_id, 0, "turn zero")
     await loop.handle_turn(session_id, 1, "turn one")

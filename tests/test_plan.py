@@ -50,7 +50,15 @@ async def test_plan_generates_exactly_generation_width_candidates():
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_plan_audit_row_contains_all_candidate_breakdowns(
-    store, transcript, node_calls, clean_pool
+    store,
+    transcript,
+    node_calls,
+    clean_pool,
+    learner_id,
+    concept_graph_id,
+    concept_graph,
+    learner_overlay,
+    revision_store,
 ):
     # Seed a hypothesis so information_value has something to work with,
     # though with default stub INFO_RESPONSES="[]" it stays at 0.
@@ -67,9 +75,12 @@ async def test_plan_audit_row_contains_all_candidate_breakdowns(
         hypothesis_store=store,
         transcript=transcript,
         node_calls=node_calls,
+        concept_graph=concept_graph,
+        learner_overlay=learner_overlay,
+        revision_store=revision_store,
         llm=StubLLMClient(),
     )
-    session_id = await transcript.create_session()
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
     await loop.handle_turn(session_id, 0, "turn zero")
 
     async with clean_pool.acquire() as conn:
@@ -106,15 +117,26 @@ async def test_plan_audit_row_contains_all_candidate_breakdowns(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_plan_winner_is_teach_targets_matching_action(
-    store, transcript, node_calls, clean_pool
+    store,
+    transcript,
+    node_calls,
+    clean_pool,
+    learner_id,
+    concept_graph_id,
+    concept_graph,
+    learner_overlay,
+    revision_store,
 ):
     loop = SessionLoop(
         hypothesis_store=store,
         transcript=transcript,
         node_calls=node_calls,
+        concept_graph=concept_graph,
+        learner_overlay=learner_overlay,
+        revision_store=revision_store,
         llm=StubLLMClient(),
     )
-    session_id = await transcript.create_session()
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
     await loop.handle_turn(session_id, 0, "hello")
 
     async with clean_pool.acquire() as conn:

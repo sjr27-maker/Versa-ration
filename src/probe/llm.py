@@ -63,6 +63,12 @@ _DEFAULT_RESPONSES: dict[str, str] = {
     "TEACH:": "[stub teach]",
     "PROPOSE:ACTIONS": _DEFAULT_PROPOSALS,
     "SEED:CONCEPT_GRAPH": _DEFAULT_CONCEPT_BATCH,
+    # Conservative default: no mismatch, so MismatchDetector doesn't
+    # propose revisions or reweight hypotheses unless a test opts in.
+    "MISMATCH:DETECT": json.dumps({"mismatch": False}),
+    # Conservative default: no grounding, so GroundConcept doesn't act
+    # on a fabricated concept unless a test opts in.
+    "GROUND:CONCEPT": json.dumps({"concept_id": None, "confidence": 0.0}),
     # ValueFunction stubs — conservative middle values so score() is well-
     # defined even without canned test overrides. Individual tests provide
     # explicit canned responses when they want specific values.

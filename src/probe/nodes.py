@@ -6,26 +6,38 @@ each node's responsibility — `SessionLoop._call_node()` intercepts and
 records every call. See CLAUDE.md invariant 2.
 
 Most nodes are stubs at this stage; the reasoning logic lands in later
-steps. `Update` is real because it only depends on the already-built
-HypothesisStore.
+steps. `Update` and `Diagnose` are real because they only depend on
+already-built stores/services.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from typing import Any
+from uuid import UUID
 
+from probe.audit import TranscriptStore
+from probe.concept_graph import ConceptGraph
+from probe.grounding import GroundConcept
 from probe.llm import LLMClient
+from probe.mismatch import MismatchDetector
 from probe.models import (
     ActionScore,
     CandidateAction,
     EvidenceRef,
     Hypothesis,
+    Layer,
     PlanOutput,
+    Polarity,
     ProposedEvidence,
+    SuggestedCause,
     TeachingAction,
     Tier,
+    WorldModelRevision,
 )
+from probe.overlay import LearnerOverlay
+from probe.revision import WorldModelRevisionStore
 from probe.store import HypothesisStore
 from probe.value_function import ValueFunction
 
@@ -35,6 +47,14 @@ _MAX_WIDTH = 8
 
 # One corrective re-ask when the proposer emits actions outside the enum.
 _MAX_PROPOSE_ATTEMPTS = 2
+
+# Diagnose: minimum MismatchResult.confidence required to act on
+# suggested_cause=possible_world_model_error by proposing a
+# WorldModelRevision. Intentionally low — proposals are supervised and
+# reversible via review-revisions, so bias toward over-proposing while
+# gathering real interaction data; revisit once session data exists to
+# set this empirically.
+DIAGNOSE_MISMATCH_THRESHOLD = 0.4
 
 
 class Infer:
@@ -290,13 +310,193 @@ class Test:
 
 
 class Diagnose:
-    async def run(self, response: str, expectation: str) -> dict:
-        # Real classifier lives later.
-        return {
+    """Compares a learner's apparent belief against the world model.
+
+    The response-vs-expectation classification is still the Step-2
+    stub — a real classifier lives later. What's real here:
+
+    1. GroundConcept determines which concept (if any) `response` is
+       actually about, from the full list of nodes in *this session's*
+       linked graph (`session_id` -> `concept_graph_id`, via
+       `TranscriptStore.get_concept_graph_id` — a session's graph is
+       set once at creation, same pattern as its learner). A
+       hallucinated id GroundConcept didn't validate, or a grounding
+       below `_GROUNDING_CONFIDENCE_THRESHOLD`, skips the rest of this
+       method gracefully, same as an unrecognized concept_id always has.
+       The grounding's own concept_id/confidence is recorded on the
+       output regardless of whether it clears the threshold, so a
+       low-confidence-but-still-acted-on grounding stays visible on
+       review, not folded silently into the final MismatchResult.
+    2. The learner's OverlayEntry and the mental_model hypotheses
+       already linked to the grounded concept (via
+       `HypothesisStore.list_by_concept` — Hypothesis itself carries no
+       concept_id; see `hypothesis_concepts`) go to `MismatchDetector`,
+       whose judgment is acted on:
+
+       - `possible_world_model_error` above `DIAGNOSE_MISMATCH_THRESHOLD`
+         → propose a `WorldModelRevision`. Never auto-applied — it sits
+         pending until a human reviews it (`probe review-revisions`).
+         `result["mismatch"]` (and its `confidence`) is persisted
+         regardless of whether the threshold is cleared — see
+         CLAUDE.md invariant 2 — so a below-threshold mismatch the
+         loop declined to act on is still visible on review, not
+         silently dropped.
+       - `learner_misconception` → append supporting evidence to each
+         matched hypothesis via `HypothesisStore.reweight` directly,
+         not by calling `Update().run(...)`: CLAUDE.md invariant 2
+         forbids invoking a Node's `run()` from a production path
+         outside `SessionLoop._call_node`, so this goes straight to the
+         same `reweight()` path `Update` itself uses — nothing bypasses
+         evidence-append.
+
+    Concept *selection* ("what should we teach next") is explicitly out
+    of scope here — this only identifies what the current response is
+    about.
+    """
+
+    # The revision-proposal threshold lives at module level as
+    # DIAGNOSE_MISMATCH_THRESHOLD (it directly controls how often the
+    # possible_world_model_error path can fire, so it's named and
+    # documented there, not buried here).
+    #
+    # _GROUNDING_CONFIDENCE_THRESHOLD is a separate, unrelated decision
+    # (whether GroundConcept's judgment is trusted enough to run
+    # mismatch detection at all) — still an arbitrary midpoint
+    # placeholder, not measured or reasoned from anything. Do not
+    # assume tuning one of these two thresholds should move the other.
+    _GROUNDING_CONFIDENCE_THRESHOLD = 0.5
+
+    def __init__(
+        self,
+        mismatch_detector: MismatchDetector,
+        ground_concept: GroundConcept,
+        hypothesis_store: HypothesisStore,
+        revision_store: WorldModelRevisionStore,
+        concept_graph: ConceptGraph,
+        learner_overlay: LearnerOverlay,
+        transcript: TranscriptStore,
+    ) -> None:
+        self._detector = mismatch_detector
+        self._grounder = ground_concept
+        self._hyp = hypothesis_store
+        self._revisions = revision_store
+        self._concepts = concept_graph
+        self._overlay = learner_overlay
+        self._transcript = transcript
+
+    async def run(
+        self,
+        response: str,
+        expectation: str,
+        session_id: UUID,
+        turn_id: UUID,
+    ) -> dict:
+        result: dict[str, Any] = {
             "classification": "unknown",
             "matched_expectation": False,
-            "notes": "stub diagnose — no real classifier yet",
+            "notes": "stub response/expectation classifier — no real "
+            "classifier yet",
+            "grounding": None,
+            "mismatch": None,
+            "action_taken": "none",
+            "revision_id": None,
+            "reweighted_hypothesis_ids": [],
+            # Real LLM calls this run() made: grounding always counts,
+            # mismatch detection only if grounding cleared the
+            # threshold. Costs nothing against the stub, but means the
+            # per-turn call-count data is already sitting in node_calls
+            # once a real LLM is behind this instead of needing
+            # instrumentation added retroactively — same reasoning as
+            # ActionScore.information_value_call_count.
+            "llm_call_count": 0,
         }
+
+        learner_id = await self._transcript.get_learner_id(session_id)
+        concept_graph_id = await self._transcript.get_concept_graph_id(session_id)
+
+        candidates = await self._concepts.list_concepts(concept_graph_id)
+        grounding = await self._grounder.detect(response, candidates)
+        result["llm_call_count"] += self._grounder.last_call_count
+        result["grounding"] = grounding.model_dump(mode="json")
+
+        if (
+            grounding.concept_id is None
+            or grounding.confidence < self._GROUNDING_CONFIDENCE_THRESHOLD
+        ):
+            result["notes"] += (
+                "; response did not clearly ground to a concept in this "
+                "session's graph, skipped mismatch check"
+            )
+            return result
+        concept_id = grounding.concept_id
+
+        concept = await self._concepts.get_concept(concept_graph_id, concept_id)
+        if concept is None:
+            result["notes"] += (
+                f"; concept {concept_id!r} not found, skipped mismatch check"
+            )
+            return result
+
+        overlay_entry = await self._overlay.get_state(
+            learner_id, concept_graph_id, concept_id
+        )
+        hypotheses = await self._hyp.list_by_concept(
+            concept_graph_id, concept_id, layer=Layer.MENTAL_MODEL, tier=Tier.ACTIVE
+        )
+
+        mismatch = await self._detector.detect(
+            concept_id, concept, overlay_entry, hypotheses
+        )
+        result["llm_call_count"] += self._detector.last_call_count
+        if mismatch is None:
+            return result
+        result["mismatch"] = mismatch.model_dump(mode="json")
+
+        if (
+            mismatch.suggested_cause is SuggestedCause.POSSIBLE_WORLD_MODEL_ERROR
+            and mismatch.confidence >= DIAGNOSE_MISMATCH_THRESHOLD
+        ):
+            revision = await self._revisions.propose(
+                WorldModelRevision(
+                    concept_graph_id=concept_graph_id,
+                    concept_id=concept_id,
+                    proposed_change=(
+                        f"possible error in concept {concept_id!r}: learner "
+                        f"claims {mismatch.learner_claim!r}, which conflicts "
+                        f"with world_claim {mismatch.world_claim!r}"
+                    ),
+                    evidence_refs=[
+                        EvidenceRef(turn_id=turn_id, polarity=Polarity.SUPPORTING)
+                    ],
+                    confidence=mismatch.confidence,
+                )
+            )
+            result["action_taken"] = "revision_proposed"
+            result["revision_id"] = str(revision.id)
+        elif mismatch.suggested_cause is SuggestedCause.LEARNER_MISCONCEPTION:
+            reweighted_ids: list[str] = []
+            for hyp in hypotheses:
+                evidence_ref = EvidenceRef(
+                    turn_id=turn_id, polarity=Polarity.SUPPORTING
+                )
+                new_probability = hyp.probability + mismatch.confidence * (
+                    1.0 - hyp.probability
+                )
+                new_confidence = hyp.confidence + mismatch.confidence * (
+                    1.0 - hyp.confidence
+                )
+                await self._hyp.reweight(
+                    hyp.id,
+                    min(1.0, new_probability),
+                    min(1.0, new_confidence),
+                    evidence_ref,
+                )
+                reweighted_ids.append(str(hyp.id))
+            if reweighted_ids:
+                result["action_taken"] = "hypothesis_reweighted"
+            result["reweighted_hypothesis_ids"] = reweighted_ids
+
+        return result
 
 
 class Update:

@@ -47,13 +47,57 @@ class TranscriptStore:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
 
-    async def create_session(self, session_id: UUID | None = None) -> UUID:
+    async def create_session(
+        self,
+        learner_id: UUID,
+        concept_graph_id: UUID,
+        session_id: UUID | None = None,
+    ) -> UUID:
         session_id = session_id or uuid4()
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO sessions (id) VALUES ($1)", session_id
+                "INSERT INTO sessions (id, learner_id, concept_graph_id) "
+                "VALUES ($1, $2, $3)",
+                session_id,
+                learner_id,
+                concept_graph_id,
             )
         return session_id
+
+    async def get_learner_id(self, session_id: UUID) -> UUID:
+        """The learner a session belongs to — set once at creation, not
+        per-turn state. This is how a node (e.g. Diagnose) gets
+        learner_id: looked up from the session row it already has
+        session_id for, not threaded through as separate call state.
+        """
+        async with self._pool.acquire() as conn:
+            learner_id = await conn.fetchval(
+                "SELECT learner_id FROM sessions WHERE id = $1", session_id
+            )
+        if learner_id is None:
+            raise KeyError(f"session {session_id} not found")
+        return learner_id
+
+    async def get_concept_graph_id(self, session_id: UUID) -> UUID:
+        """The concept graph this session is teaching — set once at
+        creation, same pattern as `get_learner_id`. This is how
+        Diagnose/GroundConcept get "this session's linked graph"
+        without it being threaded as separate call state.
+        """
+        async with self._pool.acquire() as conn:
+            graph_id = await conn.fetchval(
+                "SELECT concept_graph_id FROM sessions WHERE id = $1", session_id
+            )
+        if graph_id is None:
+            raise KeyError(f"session {session_id} not found")
+        return graph_id
+
+    async def count_sessions_for_learner(self, learner_id: UUID) -> int:
+        async with self._pool.acquire() as conn:
+            count = await conn.fetchval(
+                "SELECT count(*) FROM sessions WHERE learner_id = $1", learner_id
+            )
+        return count
 
     async def record_turn(
         self, session_id: UUID, turn_index: int, text: str

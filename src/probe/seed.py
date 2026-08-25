@@ -2,14 +2,16 @@
 
 This is explicitly not an ingestion pipeline: it runs once per topic,
 parses and validates the LLM's proposed batch, and hands it to
-`ConceptGraph.add_batch` — which does the prerequisite-existence and
-cycle validation and inserts atomically. There is no update path here;
-the graph is meant to be frozen after this call.
+`ConceptGraph.add_batch` — which creates the `concept_graphs` row and
+inserts the nodes atomically (prerequisite-existence and cycle
+validation included). There is no update path here; the graph is meant
+to be frozen after this call.
 """
 
 from __future__ import annotations
 
 import json
+from uuid import UUID, uuid4
 
 from probe.concept_graph import ConceptGraph
 from probe.llm import LLMClient
@@ -41,7 +43,8 @@ def _seed_prompt(topic: str) -> str:
 
 async def seed_graph(
     llm: LLMClient, graph: ConceptGraph, topic: str
-) -> list[ConceptNode]:
+) -> tuple[UUID, list[ConceptNode]]:
+    """Returns (concept_graph_id, concepts)."""
     raw = await llm.complete(_seed_prompt(topic))
     try:
         parsed = json.loads(raw)
@@ -54,6 +57,7 @@ async def seed_graph(
             "seed-graph response was not a non-empty JSON list"
         )
 
+    concept_graph_id = uuid4()
     concepts: list[ConceptNode] = []
     for item in parsed:
         if not isinstance(item, dict):
@@ -61,13 +65,19 @@ async def seed_graph(
                 f"seed-graph proposed a non-object entry: {item!r}"
             )
         try:
-            concepts.append(ConceptNode.model_validate(item))
+            concepts.append(
+                ConceptNode.model_validate(
+                    {**item, "concept_graph_id": concept_graph_id}
+                )
+            )
         except Exception as exc:
             raise SeedGraphError(
                 f"seed-graph proposed an invalid concept: {exc}"
             ) from exc
 
     # add_batch validates prerequisite-existence-within-batch and
-    # acyclicity, and inserts everything in one transaction — a
-    # validation failure there means nothing was written.
-    return await graph.add_batch(concepts)
+    # acyclicity, creates the concept_graphs row, and inserts everything
+    # in one transaction — a validation failure there means nothing was
+    # written, not even the graph row.
+    persisted = await graph.add_batch(concept_graph_id, topic, concepts)
+    return concept_graph_id, persisted

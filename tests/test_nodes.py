@@ -25,13 +25,15 @@ def _hypothesis() -> Hypothesis:
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_update_applies_reweight_for_each_proposal(store, transcript):
+async def test_update_applies_reweight_for_each_proposal(
+    store, transcript, learner_id, concept_graph_id
+):
     hyp_a = _hypothesis()
     hyp_b = _hypothesis()
     await store.add(hyp_a)
     await store.add(hyp_b)
 
-    session_id = await transcript.create_session()
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
     turn = await transcript.record_turn(session_id, 0, "shared turn")
     proposals = [
         ProposedEvidence(
@@ -74,11 +76,13 @@ async def test_update_applies_reweight_for_each_proposal(store, transcript):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_update_appends_rather_than_overwrites_evidence(store, transcript):
+async def test_update_appends_rather_than_overwrites_evidence(
+    store, transcript, learner_id, concept_graph_id
+):
     hyp = _hypothesis()
     await store.add(hyp)
 
-    session_id = await transcript.create_session()
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
     first_turn = await transcript.record_turn(session_id, 0, "first")
     await Update().run(
         [
