@@ -47,7 +47,7 @@ class SessionLoop:
         self._node_calls = node_calls
         self.value_function = ValueFunction(llm, value_function_config)
         self.infer = Infer(llm)
-        self.plan = Plan(self.value_function)
+        self.plan = Plan(self.value_function, llm)
         self.teach = Teach(llm)
         self.test = Test()
         self.diagnose = Diagnose()

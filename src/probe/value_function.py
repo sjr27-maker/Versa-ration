@@ -9,11 +9,15 @@ returns 0.0 and skips its LLM calls. `score()` aggregates:
 
 The full six-term breakdown is preserved on `ActionScore` even when
 some terms are zero, so ablation runs stay comparable in `node_calls`.
+
+Scoring anomalies are named on `ActionScore.flags` rather than silently
+folded into `total` — see `FLAG_NEGATIVE_INFORMATION_VALUE`.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import math
 
 from pydantic import BaseModel
@@ -27,6 +31,14 @@ from probe.models import (
     TeachingAction,
     Tier,
 )
+
+logger = logging.getLogger(__name__)
+
+# Flag names written onto ActionScore.flags. Expected information gain is
+# non-negative in theory; a negative one means the response model and the
+# posterior model disagree, so it's a modelling bug worth seeing rather
+# than a number to quietly absorb into `total`.
+FLAG_NEGATIVE_INFORMATION_VALUE = "negative_information_value"
 
 
 class ValueFunctionConfig(BaseModel):
@@ -179,7 +191,21 @@ class ValueFunction:
                 h_after_given += _bernoulli_entropy(new_p)
             expected_h_after += prob * h_after_given
 
-        return h_before - expected_h_after
+        gain = h_before - expected_h_after
+        if gain < 0.0:
+            logger.warning(
+                "negative information_value for action=%s "
+                "(target_concept=%s): entropy_before=%.6f bits, "
+                "expected_entropy_after=%.6f bits, gain=%.6f bits. "
+                "Expected information gain should be >= 0; the simulated "
+                "responses are pushing hypotheses toward higher entropy.",
+                action.action.value,
+                action.target_concept,
+                h_before,
+                expected_h_after,
+                gain,
+            )
+        return gain
 
     async def long_term_value(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
@@ -268,6 +294,10 @@ class ValueFunction:
 
         total = lv + iv + ltv - tc - cc - fr
 
+        flags: list[str] = []
+        if cfg.enable_information_value and iv < 0.0:
+            flags.append(FLAG_NEGATIVE_INFORMATION_VALUE)
+
         return ActionScore(
             candidate=action,
             learning_value=lv,
@@ -278,6 +308,7 @@ class ValueFunction:
             frustration_risk=fr,
             total=total,
             information_value_call_count=iv_calls,
+            flags=flags,
         )
 
     async def _ask_scalar(self, prompt: str) -> float:

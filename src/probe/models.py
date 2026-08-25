@@ -123,6 +123,11 @@ class ActionScore(BaseModel):
     value will be 0.0). `total` is the raw sum used for ranking; the
     per-term fields are what the ablation dashboard reads. Do not
     collapse this to a single float — CLAUDE.md invariant 3.
+
+    `flags` names anomalies detected while scoring (see
+    `probe.value_function` for the flag constants), so `node_calls` can
+    be filtered on them without re-deriving the condition from raw
+    floats.
     """
 
     candidate: CandidateAction
@@ -134,6 +139,7 @@ class ActionScore(BaseModel):
     frustration_risk: float
     total: float
     information_value_call_count: int = 0
+    flags: list[str] = Field(default_factory=list)
 
 
 class PlanOutput(BaseModel):

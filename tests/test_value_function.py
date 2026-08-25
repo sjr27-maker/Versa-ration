@@ -1,4 +1,5 @@
 import json
+import logging
 from uuid import uuid4
 
 import pytest
@@ -12,7 +13,11 @@ from probe.models import (
     TeachingAction,
     Tier,
 )
-from probe.value_function import ValueFunction, ValueFunctionConfig
+from probe.value_function import (
+    FLAG_NEGATIVE_INFORMATION_VALUE,
+    ValueFunction,
+    ValueFunctionConfig,
+)
 
 
 def _hyp(
@@ -202,8 +207,92 @@ async def test_score_result_is_an_action_score_with_full_breakdown():
         "frustration_risk",
         "total",
         "information_value_call_count",
+        "flags",
     ):
         assert hasattr(score, field), field
+
+
+# --- negative information gain ----------------------------------------
+
+
+def _negative_gain_llm(hyp: Hypothesis) -> StubLLMClient:
+    """A fixture whose simulated response *raises* entropy.
+
+    The hypothesis starts near-certain (p=0.99, H≈0.081 bits) and the one
+    simulated response drags it back to maximum uncertainty (p=0.5,
+    H=1.0 bit), so expected gain ≈ -0.919 bits.
+    """
+    return StubLLMClient(
+        canned={
+            "SCORE:LEARNING_VALUE": "0.5",
+            "SCORE:COGNITIVE_COST": "0.2",
+            "SCORE:FRUSTRATION_RISK": "0.1",
+            "SCORE:INFO_RESPONSES": json.dumps(
+                [{"response": "student contradicts themselves", "probability": 1.0}]
+            ),
+            "SCORE:INFO_UPDATE": json.dumps({str(hyp.id): 0.5}),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_negative_information_value_logs_a_warning_with_entropies(caplog):
+    hyp = _hyp(probability=0.99)
+    vf = ValueFunction(_negative_gain_llm(hyp))
+    action = _action(TeachingAction.QUIZ)
+
+    with caplog.at_level(logging.WARNING, logger="probe.value_function"):
+        iv = await vf.information_value(action, [hyp])
+
+    assert iv < 0
+    records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "quiz" in message
+    assert "entropy_before" in message and "expected_entropy_after" in message
+    # H(0.99) ≈ 0.0808, H(0.5) = 1.0 — both must be legible in the log line.
+    assert "0.080793" in message
+    assert "1.000000" in message
+
+
+@pytest.mark.asyncio
+async def test_negative_information_value_sets_flag_on_action_score():
+    hyp = _hyp(probability=0.99)
+    vf = ValueFunction(_negative_gain_llm(hyp))
+    score = await vf.score(_action(TeachingAction.QUIZ), [hyp], {})
+
+    assert score.information_value < 0
+    assert FLAG_NEGATIVE_INFORMATION_VALUE in score.flags
+    # The raw value is still summed into total — the flag surfaces it,
+    # it doesn't suppress it.
+    assert score.total == pytest.approx(
+        score.learning_value
+        + score.information_value
+        + score.long_term_value
+        - score.time_cost
+        - score.cognitive_cost
+        - score.frustration_risk
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_flag_when_information_value_is_non_negative():
+    vf = ValueFunction(StubLLMClient())  # default INFO_RESPONSES -> "[]"
+    score = await vf.score(_action(), [_hyp()], {})
+    assert score.information_value == 0.0
+    assert score.flags == []
+
+
+@pytest.mark.asyncio
+async def test_no_negative_flag_when_information_value_is_disabled():
+    hyp = _hyp(probability=0.99)
+    vf = ValueFunction(
+        _negative_gain_llm(hyp),
+        ValueFunctionConfig(enable_information_value=False),
+    )
+    score = await vf.score(_action(TeachingAction.QUIZ), [hyp], {})
+    assert score.information_value == 0.0
+    assert FLAG_NEGATIVE_INFORMATION_VALUE not in score.flags
 
 
 def test_teaching_action_enum_has_exactly_21_members():
