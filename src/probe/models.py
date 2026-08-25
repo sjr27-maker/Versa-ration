@@ -155,6 +155,45 @@ class PlanOutput(BaseModel):
     scores: list[ActionScore]
 
 
+class ConceptNode(BaseModel):
+    """A node in the world concept graph — not learner-specific.
+
+    Seeded once via `probe seed-graph` and frozen afterward. `prerequisites`
+    holds concept ids only; `ConceptGraph` resolves them against the
+    `concept_prerequisites` edge table, it does not embed nested nodes.
+    """
+
+    id: str
+    name: str
+    prerequisites: list[str] = Field(default_factory=list)
+    common_misconceptions: list[str] = Field(default_factory=list)
+    representations: list[str] = Field(default_factory=list)
+    diagnostic_questions: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class OverlayState(str, Enum):
+    KNOWN = "known"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+    BLOCKED = "blocked"
+
+
+class OverlayEntry(BaseModel):
+    """A learner's current state on one concept.
+
+    Unlike `Hypothesis`, this is current-state tracking, not a claim
+    with an evidence trail — `LearnerOverlay.set_state()` upserts. Do
+    not route this through `HypothesisStore`.
+    """
+
+    concept_id: str
+    state: OverlayState
+    confidence: float = Field(ge=0.0, le=1.0)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
 class ProposedEvidence(BaseModel):
     """The Infer→Update handoff.
 

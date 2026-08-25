@@ -56,3 +56,26 @@ Why: this codebase is a research artifact whose main question is which
 terms actually matter. If turning one off requires editing code, we
 can't run apples-to-apples ablations. Keep the config knob, keep the
 breakdown, don't collapse to a single float.
+
+### 4. The concept graph is append-only
+
+`ConceptGraph` must never delete rows. Concretely:
+
+- No `delete` / `remove` methods on the class.
+- No `DELETE` SQL anywhere in the `concept_graph` module or its
+  migrations.
+- Verified by the same AST-based check used for invariant 1 (scan for
+  delete/remove-prefixed function names and DELETE inside string
+  literals, excluding docstrings).
+
+This is a separate invariant from #1, not a restatement of it: the
+rationale is different, so it gets its own entry rather than being
+folded into the hypothesis-store rule.
+
+Why: the concept graph is seeded once (`probe seed-graph`) and frozen —
+it isn't a record of evolving belief the way hypotheses are. The reason
+it can't be deleted from is referential, not auditability: `LearnerOverlay`
+holds an FK to `concept_nodes.id`. Removing a concept out from under it
+would either orphan overlay rows or require a cascade that silently
+destroys learner state. `ON DELETE RESTRICT` on that FK enforces this at
+the schema level; no delete method enforces it at the code level.

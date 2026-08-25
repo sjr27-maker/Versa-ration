@@ -5,7 +5,9 @@ import pytest
 import pytest_asyncio
 
 from probe.audit import NodeCallStore, TranscriptStore
+from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
+from probe.overlay import LearnerOverlay
 from probe.store import HypothesisStore
 
 DATABASE_URL = os.getenv(
@@ -36,6 +38,10 @@ async def pool():
         await conn.execute("DROP TABLE IF EXISTS turns CASCADE")
         await conn.execute("DROP TABLE IF EXISTS sessions CASCADE")
         await conn.execute("DROP TABLE IF EXISTS hypotheses CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS learner_overlay CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS concept_prerequisites CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS concept_nodes CASCADE")
+        await conn.execute("DROP TYPE IF EXISTS overlay_state")
         await conn.execute("DROP TYPE IF EXISTS evidence_polarity")
         await conn.execute("DROP TYPE IF EXISTS hypothesis_tier")
         await conn.execute("DROP TYPE IF EXISTS hypothesis_layer")
@@ -51,7 +57,8 @@ async def pool():
 async def clean_pool(pool):
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE node_calls, turns, sessions, evidence_refs, hypotheses "
+            "TRUNCATE node_calls, turns, sessions, evidence_refs, hypotheses, "
+            "learner_overlay, concept_prerequisites, concept_nodes "
             "RESTART IDENTITY CASCADE"
         )
     return pool
@@ -70,3 +77,13 @@ async def transcript(clean_pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def node_calls(clean_pool):
     return NodeCallStore(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def concept_graph(clean_pool):
+    return ConceptGraph(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def learner_overlay(clean_pool):
+    return LearnerOverlay(clean_pool)

@@ -35,11 +35,34 @@ _DEFAULT_PROPOSALS = json.dumps(
 )
 
 
+_DEFAULT_CONCEPT_BATCH = json.dumps(
+    [
+        {
+            "id": "stub_base",
+            "name": "Stub Base Concept",
+            "prerequisites": [],
+            "common_misconceptions": [],
+            "representations": ["formal"],
+            "diagnostic_questions": ["what is the stub base concept?"],
+        },
+        {
+            "id": "stub_derived",
+            "name": "Stub Derived Concept",
+            "prerequisites": ["stub_base"],
+            "common_misconceptions": [],
+            "representations": ["formal"],
+            "diagnostic_questions": ["how does stub derived build on stub base?"],
+        },
+    ]
+)
+
+
 _DEFAULT_RESPONSES: dict[str, str] = {
     # Existing loop nodes.
     "INFER:": "[]",
     "TEACH:": "[stub teach]",
     "PROPOSE:ACTIONS": _DEFAULT_PROPOSALS,
+    "SEED:CONCEPT_GRAPH": _DEFAULT_CONCEPT_BATCH,
     # ValueFunction stubs — conservative middle values so score() is well-
     # defined even without canned test overrides. Individual tests provide
     # explicit canned responses when they want specific values.
