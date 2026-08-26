@@ -1,4 +1,5 @@
 import json
+import logging
 
 import pytest
 
@@ -339,3 +340,82 @@ async def test_over_long_proposal_is_truncated_to_generation_width():
         TeachingAction.EXPLAIN,
         TeachingAction.ASK,
     ]
+
+
+# --- exploration-slot wiring (reasoning budget) ------------------------
+
+DORMANT_HYP = _hyp(
+    Layer.KNOWLEDGE, "student may have forgotten base-case handling", Tier.DORMANT
+)
+
+
+@pytest.mark.asyncio
+async def test_exploration_target_instruction_appears_in_the_prompt():
+    llm = StubLLMClient()
+    await _plan(llm).run(
+        hypotheses=[PLAIN_HYP, DORMANT_HYP],
+        concept_state={},
+        generation_width=3,
+        exploration_target=DORMANT_HYP,
+    )
+    propose_prompts = [p for p in llm.prompts if p.startswith("PROPOSE:ACTIONS")]
+    assert len(propose_prompts) == 1
+    prompt = propose_prompts[0]
+    assert str(DORMANT_HYP.id) in prompt
+    assert DORMANT_HYP.statement in prompt
+    assert "exploration budget" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_no_exploration_target_omits_the_instruction_and_logs(caplog):
+    llm = StubLLMClient()
+    with caplog.at_level(logging.INFO, logger="probe.nodes"):
+        await _plan(llm).run(
+            hypotheses=[PLAIN_HYP],
+            concept_state={},
+            generation_width=3,
+            exploration_target=None,
+        )
+    propose_prompts = [p for p in llm.prompts if p.startswith("PROPOSE:ACTIONS")]
+    assert "exploration budget" not in propose_prompts[0].lower()
+    assert any(
+        "no exploration_target" in r.getMessage().lower() for r in caplog.records
+    ), "Plan must log, not silently proceed, when there's nothing to explore"
+
+
+@pytest.mark.asyncio
+async def test_exploration_candidate_actually_targets_the_dormant_hypothesis():
+    """Not just 'width increased by 1' — the candidate the exploration
+    instruction produces must be visible in the scored output and must
+    actually reference the dormant hypothesis, not the dominant one."""
+
+    def proposer(prompt: str) -> str:
+        assert str(DORMANT_HYP.id) in prompt  # the instruction reached the model
+        return json.dumps(
+            [
+                _proposal("explain", "keep reinforcing the current top belief"),
+                _proposal("recall", "keep reinforcing the current top belief"),
+                _proposal(
+                    "correct_misconception",
+                    f"[exploration] probe hypothesis {DORMANT_HYP.id} "
+                    f"({DORMANT_HYP.statement}) directly",
+                ),
+            ]
+        )
+
+    llm = StubLLMClient(canned={"PROPOSE:ACTIONS": proposer})
+    result = await _plan(llm).run(
+        hypotheses=[PLAIN_HYP, DORMANT_HYP],
+        concept_state={},
+        generation_width=3,
+        exploration_target=DORMANT_HYP,
+    )
+
+    exploration_candidates = [
+        s.candidate
+        for s in result.scores
+        if s.candidate.rationale.startswith("[exploration]")
+    ]
+    assert len(exploration_candidates) == 1
+    assert str(DORMANT_HYP.id) in exploration_candidates[0].rationale
+    assert DORMANT_HYP.statement in exploration_candidates[0].rationale

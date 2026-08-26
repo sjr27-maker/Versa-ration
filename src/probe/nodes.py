@@ -13,7 +13,7 @@ already-built stores/services.
 from __future__ import annotations
 
 import json
-import math
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -37,13 +37,19 @@ from probe.models import (
     WorldModelRevision,
 )
 from probe.overlay import LearnerOverlay
+from probe.reasoning_budget import (
+    ReasoningBudget,
+    ReasoningBudgetConfig,
+    compute_reasoning_budget,
+)
 from probe.revision import WorldModelRevisionStore
 from probe.store import HypothesisStore
 from probe.value_function import ValueFunction
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_GENERATION_WIDTH = 3
 _MIN_WIDTH = 1
-_MAX_WIDTH = 8
 
 # One corrective re-ask when the proposer emits actions outside the enum.
 _MAX_PROPOSE_ATTEMPTS = 2
@@ -56,10 +62,30 @@ _MAX_PROPOSE_ATTEMPTS = 2
 # set this empirically.
 DIAGNOSE_MISMATCH_THRESHOLD = 0.4
 
+# Per-turn LLM-call guardrail, checked in SessionLoop.handle_turn against
+# call-count instrumentation on every LLM-calling node/term: Diagnose's
+# output_json (llm_call_count, covering GroundConcept + MismatchDetector),
+# Infer.last_call_count, Plan.last_generate_call_count, each candidate's
+# ActionScore (learning_value/information_value/cognitive_cost/
+# frustration_risk_call_count), and Teach.last_call_count. This is a
+# complete count, not a floor — verified against a real turn (28 real
+# LLM calls, 28 counted) after an earlier version of this guardrail only
+# summed Diagnose + information_value and silently undercounted by 4x.
+# This is a loud-warning guardrail, not a hard stop: crossing it logs
+# and the turn continues — reasoning is never truncated or candidates
+# silently dropped to stay under it. 30 is an arbitrary starting point,
+# not a measured budget; revisit once real per-turn costs are observed
+# against a real client.
+MAX_CALLS_PER_TURN = 30
+
 
 class Infer:
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
+        # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting.
+        # Public (not _-prefixed) since, like GroundConcept/MismatchDetector's
+        # last_call_count, the reader is a different class.
+        self.last_call_count: int = 0
 
     async def run(
         self,
@@ -67,6 +93,7 @@ class Infer:
         hypotheses: list[Hypothesis],
         generation_width: int = DEFAULT_GENERATION_WIDTH,
     ) -> list[ProposedEvidence]:
+        self.last_call_count = 0
         # Real prompt lives in Step 2. For now we ship the plumbing: the
         # LLM is asked for a JSON list of {hypothesis_id, new_probability,
         # new_confidence, polarity} objects, and any parse failure yields
@@ -83,6 +110,7 @@ class Infer:
             f"Hypotheses:\n{listing}\n"
         )
         raw = await self._llm.complete(prompt)
+        self.last_call_count += 1
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
@@ -117,15 +145,29 @@ class Plan:
     def __init__(self, value_function: ValueFunction, llm: LLMClient) -> None:
         self._vf = value_function
         self._llm = llm
+        # Set by _generate(); read by SessionLoop into the
+        # MAX_CALLS_PER_TURN accounting. Covers only the proposer's own
+        # calls (1 or 2, depending on the correction retry) — each
+        # candidate's scoring calls live on that candidate's ActionScore
+        # instead, since they're per-candidate, not per-Plan-invocation.
+        self.last_generate_call_count: int = 0
 
     async def run(
         self,
         hypotheses: list[Hypothesis],
         concept_state: dict,
         generation_width: int,
+        exploration_target: Hypothesis | None = None,
     ) -> PlanOutput:
+        if exploration_target is None:
+            logger.info(
+                "Plan: no exploration_target this turn (no dormant/background "
+                "hypothesis to explore) — generation_width=%d spent entirely "
+                "on the current top hypothesis, no reservation used",
+                generation_width,
+            )
         candidates = await self._generate(
-            hypotheses, concept_state, generation_width
+            hypotheses, concept_state, generation_width, exploration_target
         )
         scores: list[ActionScore] = []
         for candidate in candidates:
@@ -138,6 +180,7 @@ class Plan:
         hypotheses: list[Hypothesis],
         concept_state: dict,
         generation_width: int,
+        exploration_target: Hypothesis | None,
     ) -> list[CandidateAction]:
         """Ask the LLM for `generation_width` distinct plausible actions.
 
@@ -151,11 +194,15 @@ class Plan:
         proposed: list[CandidateAction] = []
         seen: set[TeachingAction] = set()
         rejected: list[str] = []
+        self.last_generate_call_count = 0
 
         for _ in range(_MAX_PROPOSE_ATTEMPTS):
             raw = await self._llm.complete(
-                _propose_prompt(hypotheses, concept_state, width, rejected)
+                _propose_prompt(
+                    hypotheses, concept_state, width, rejected, exploration_target
+                )
             )
+            self.last_generate_call_count += 1
             candidates, rejected = _parse_proposals(raw, concept_state)
             for candidate in candidates:
                 if candidate.action in seen:
@@ -187,6 +234,7 @@ def _propose_prompt(
     concept_state: dict,
     width: int,
     rejected: list[str],
+    exploration_target: Hypothesis | None = None,
 ) -> str:
     # Same belief set the value function scores against (ValueFunction.score
     # filters to ACTIVE too), so proposer and scorer never disagree about
@@ -204,6 +252,18 @@ def _propose_prompt(
             "\nYour previous attempt included values outside the vocabulary: "
             f"{', '.join(rejected)}. Use only the listed action values.\n"
         )
+    exploration_instruction = ""
+    if exploration_target is not None:
+        exploration_instruction = (
+            "\nMaintain an exploration budget: exactly one of your "
+            f"{width} candidates must explicitly target hypothesis "
+            f"{exploration_target.id} [{exploration_target.layer.value}/"
+            f"{exploration_target.tier.value}] \"{exploration_target.statement}\" "
+            f"(p={exploration_target.probability:.2f}) rather than the "
+            "current dominant hypothesis — this is a deliberately "
+            "under-examined belief, not the most likely one. Start that "
+            'candidate\'s rationale with "[exploration]".\n'
+        )
     return (
         "PROPOSE:ACTIONS\n"
         f"Propose exactly {width} distinct teaching actions worth scoring "
@@ -213,6 +273,7 @@ def _propose_prompt(
         "hypotheses (all layers):\n"
         f"{listing}\n"
         f"{correction}"
+        f"{exploration_instruction}"
         'Respond with JSON: [{"action": "...", "target_concept": "..." or null, '
         '"rationale": "one short sentence"}, ...]'
     )
@@ -288,8 +349,11 @@ def _backfill(
 class Teach:
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
+        # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting.
+        self.last_call_count: int = 0
 
     async def run(self, action: CandidateAction) -> str:
+        self.last_call_count = 0
         prompt = (
             "TEACH: "
             + json.dumps(
@@ -300,7 +364,9 @@ class Teach:
                 }
             )
         )
-        return await self._llm.complete(prompt)
+        result = await self._llm.complete(prompt)
+        self.last_call_count += 1
+        return result
 
 
 class Test:
@@ -518,31 +584,18 @@ class Update:
 
 
 class Replan:
-    """Decides the next turn's generation width from current uncertainty.
+    """Decides the next turn's reasoning budget from current uncertainty.
 
-    Reads the active-tier hypotheses, computes total Bernoulli entropy
-    (bits) across their `probability` values, and returns an integer
-    generation_width in [_MIN_WIDTH, _MAX_WIDTH]. Higher entropy → wider
-    generation next turn. The width is threaded into next turn's
-    `Infer.run(...)` by SessionLoop.
-
-    This is the uncertainty-budget hook from Step 5 of the build plan.
-    The exact formula (bit-sum + linear map) is placeholder — the
-    contract that matters right now is (a) Replan runs every turn, (b)
-    its output feeds the next Infer, (c) it lives in `node_calls`.
+    Delegates entirely to `compute_reasoning_budget` (reasoning_budget.py)
+    — the single source of truth for the entropy -> generation_width /
+    run_information_value / exploration_target mapping. Replan itself
+    holds no formula; it's just the audited call site (CLAUDE.md
+    invariant 2) that feeds the result into next turn's `Infer`/`Plan`/
+    `ValueFunction` via SessionLoop.
     """
 
-    async def run(self, hypotheses: list[Hypothesis]) -> int:
-        active = [h for h in hypotheses if h.tier is Tier.ACTIVE]
-        if not active:
-            return _MIN_WIDTH
-        total_entropy_bits = sum(
-            _bernoulli_entropy(h.probability) for h in active
-        )
-        return max(_MIN_WIDTH, min(_MAX_WIDTH, 1 + int(round(total_entropy_bits))))
+    def __init__(self, config: ReasoningBudgetConfig | None = None) -> None:
+        self._config = config
 
-
-def _bernoulli_entropy(p: float) -> float:
-    if p <= 0.0 or p >= 1.0:
-        return 0.0
-    return -(p * math.log2(p) + (1.0 - p) * math.log2(1.0 - p))
+    async def run(self, hypotheses: list[Hypothesis]) -> ReasoningBudget:
+        return compute_reasoning_budget(hypotheses, self._config)

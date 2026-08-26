@@ -147,6 +147,12 @@ class ActionScore(BaseModel):
     `probe.value_function` for the flag constants), so `node_calls` can
     be filtered on them without re-deriving the condition from raw
     floats.
+
+    `*_call_count` fields cover every LLM-calling term (learning_value,
+    information_value, cognitive_cost, frustration_risk — long_term_value
+    and time_cost never call the LLM, so they have none) and are what
+    `MAX_CALLS_PER_TURN` sums across candidates to get the real per-turn
+    total, not an undercount of it.
     """
 
     candidate: CandidateAction
@@ -157,7 +163,10 @@ class ActionScore(BaseModel):
     cognitive_cost: float
     frustration_risk: float
     total: float
+    learning_value_call_count: int = 0
     information_value_call_count: int = 0
+    cognitive_cost_call_count: int = 0
+    frustration_risk_call_count: int = 0
     flags: list[str] = Field(default_factory=list)
 
 

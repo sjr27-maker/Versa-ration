@@ -13,7 +13,7 @@ from probe.audit import NodeCallStore, TranscriptStore
 from probe.concept_graph import ConceptGraph, ConceptValidationError
 from probe.db import create_pool
 from probe.learner import LearnerStore
-from probe.llm import StubLLMClient
+from probe.llm import LLMClient, ModelTierClients, StubLLMClient, build_tier_clients
 from probe.loop import SessionLoop
 from probe.models import ConceptGraphMeta, Learner
 from probe.overlay import LearnerOverlay
@@ -30,6 +30,26 @@ def _database_url() -> str:
         print("error: DATABASE_URL not set (check .env)", file=sys.stderr)
         sys.exit(2)
     return url
+
+
+def _require_gemini_api_key() -> str:
+    load_dotenv()
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        print(
+            "error: GEMINI_API_KEY not set (check .env) — pass --stub to "
+            "run against StubLLMClient instead of the real Gemini API",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return key
+
+
+def _build_tier_clients(use_stub: bool) -> ModelTierClients:
+    if use_stub:
+        stub = StubLLMClient()
+        return ModelTierClients(fast=stub, capable=stub, best=stub)
+    return build_tier_clients(_require_gemini_api_key())
 
 
 async def _resolve_learner(store: LearnerStore, spec: str) -> Learner:
@@ -57,9 +77,11 @@ async def _resolve_learner(store: LearnerStore, spec: str) -> Learner:
     return await store.create(label=spec)
 
 
-async def _do_seed_graph(graph: ConceptGraph, topic: str) -> ConceptGraphMeta:
+async def _do_seed_graph(
+    graph: ConceptGraph, topic: str, llm: LLMClient
+) -> ConceptGraphMeta:
     try:
-        concept_graph_id, concepts = await seed_graph(StubLLMClient(), graph, topic)
+        concept_graph_id, concepts = await seed_graph(llm, graph, topic)
     except (SeedGraphError, ConceptValidationError) as exc:
         print(f"error: seed-graph rejected the proposed batch: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -75,13 +97,20 @@ async def _do_seed_graph(graph: ConceptGraph, topic: str) -> ConceptGraphMeta:
     return meta
 
 
-async def _resolve_graph(graph: ConceptGraph, spec: str) -> ConceptGraphMeta:
+async def _resolve_graph(
+    graph: ConceptGraph, spec: str, llm: LLMClient
+) -> ConceptGraphMeta:
     """--topic accepts either an existing graph's UUID or a topic label.
 
-    A UUID must already exist. A label may match zero, one, or several
-    existing graphs (topic isn't unique, per migration 009) — with any
-    matches, ask which to resume rather than silently picking one; with
-    none, there's nothing to resume, so seed a fresh graph.
+    A UUID must already exist, and must have at least one concept node
+    — a graph row with zero concepts only exists if something created
+    it outside seed_graph/add_batch, and starting a chat against it
+    would silently run GroundConcept against nothing. A label may
+    match zero, one, or several existing graphs (topic isn't unique,
+    per migration 009) — with any matches, ask which to resume rather
+    than silently picking one; with none, there's nothing to resume,
+    so seed a fresh graph (which always has at least one concept,
+    since seed_graph rejects an empty proposed batch).
     """
     try:
         graph_id = UUID(spec)
@@ -91,6 +120,21 @@ async def _resolve_graph(graph: ConceptGraph, spec: str) -> ConceptGraphMeta:
         meta = await graph.get_graph(graph_id)
         if meta is None:
             print(f"error: no concept graph with id {spec}", file=sys.stderr)
+            sys.exit(2)
+        concepts = await graph.list_concepts(graph_id)
+        if not concepts:
+            # Distinct from "not found": the row exists but has zero
+            # concept_nodes, which only happens via a low-level
+            # create_graph() call outside seed_graph/add_batch's
+            # atomic (row + nodes together) path — every graph the CLI
+            # itself creates has at least one concept. Fail closed
+            # rather than start a session GroundConcept can never
+            # ground anything against.
+            print(
+                f"error: concept graph {spec} exists but has no concepts "
+                "— was it created outside seed-graph?",
+                file=sys.stderr,
+            )
             sys.exit(2)
         return meta
 
@@ -108,14 +152,15 @@ async def _resolve_graph(graph: ConceptGraph, spec: str) -> ConceptGraphMeta:
                 print("error: invalid choice", file=sys.stderr)
                 sys.exit(2)
 
-    return await _do_seed_graph(graph, spec)
+    return await _do_seed_graph(graph, spec, llm)
 
 
-async def _chat(learner_spec: str, topic_spec: str) -> None:
+async def _chat(learner_spec: str, topic_spec: str, use_stub: bool) -> None:
+    tiers = _build_tier_clients(use_stub)
     pool = await create_pool(_database_url(), min_size=1, max_size=4)
     try:
         learner = await _resolve_learner(LearnerStore(pool), learner_spec)
-        graph_meta = await _resolve_graph(ConceptGraph(pool), topic_spec)
+        graph_meta = await _resolve_graph(ConceptGraph(pool), topic_spec, tiers.capable)
         label_suffix = f" (label={learner.label!r})" if learner.label else ""
         print(f"probe: learner {learner.id}{label_suffix}")
         print(f"probe: concept graph {graph_meta.id} (topic={graph_meta.topic!r})")
@@ -127,17 +172,19 @@ async def _chat(learner_spec: str, topic_spec: str) -> None:
             concept_graph=ConceptGraph(pool),
             learner_overlay=LearnerOverlay(pool),
             revision_store=WorldModelRevisionStore(pool),
-            llm=StubLLMClient(),
+            llm=tiers.fast,
+            model_tier_clients=tiers,
         )
         await loop.run_interactive(learner.id, graph_meta.id)
     finally:
         await pool.close()
 
 
-async def _seed_graph(topic: str) -> None:
+async def _seed_graph(topic: str, use_stub: bool) -> None:
+    tiers = _build_tier_clients(use_stub)
     pool = await create_pool(_database_url(), min_size=1, max_size=4)
     try:
-        await _do_seed_graph(ConceptGraph(pool), topic)
+        await _do_seed_graph(ConceptGraph(pool), topic, tiers.capable)
     finally:
         await pool.close()
 
@@ -296,12 +343,24 @@ def main() -> None:
         help="topic label (resumes/asks if a matching graph exists, "
         "seeds fresh if not) or an existing concept graph's UUID",
     )
+    chat_parser.add_argument(
+        "--stub",
+        action="store_true",
+        help="use StubLLMClient instead of the real Gemini API (no "
+        "GEMINI_API_KEY needed, no cost)",
+    )
     seed_parser = subparsers.add_parser(
         "seed-graph",
         help="one-time LLM seed of a concept graph for a topic (frozen after creation)",
     )
     seed_parser.add_argument(
         "topic", nargs="+", help="topic to seed, e.g. python closures"
+    )
+    seed_parser.add_argument(
+        "--stub",
+        action="store_true",
+        help="use StubLLMClient instead of the real Gemini API (no "
+        "GEMINI_API_KEY needed, no cost)",
     )
     subparsers.add_parser(
         "review-revisions",
@@ -315,9 +374,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "chat":
-        asyncio.run(_chat(args.learner, args.topic))
+        asyncio.run(_chat(args.learner, args.topic, args.stub))
     elif args.command == "seed-graph":
-        asyncio.run(_seed_graph(" ".join(args.topic)))
+        asyncio.run(_seed_graph(" ".join(args.topic), args.stub))
     elif args.command == "review-revisions":
         asyncio.run(_review_revisions())
     elif args.command == "portrait":

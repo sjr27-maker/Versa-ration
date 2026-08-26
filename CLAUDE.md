@@ -1,5 +1,22 @@
 # probe
 
+## Setup
+
+Copy `.env.example` to `.env` and fill in:
+
+- `DATABASE_URL` — Postgres connection string (dev DB and the test suite
+  share this by default; running `pytest` wipes and rebuilds it from
+  migrations).
+- `GEMINI_API_KEY` — required for any real (non-stub) LLM call. Get one
+  at https://aistudio.google.com/apikey. Every `probe` command that
+  calls an LLM (`chat`, `seed-graph`) accepts `--stub` to run against
+  `StubLLMClient` instead, which needs no key and costs nothing.
+
+`GEMINI_MODEL_FAST` / `GEMINI_MODEL_CAPABLE` / `GEMINI_MODEL_BEST` are
+optional overrides for the tier→model mapping in `model_config.py` —
+only needed if the defaults there go stale (Gemini preview model ids
+shift over time).
+
 ## Invariants
 
 ### 1. The hypothesis store is append-only

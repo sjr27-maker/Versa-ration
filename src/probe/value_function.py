@@ -107,8 +107,17 @@ class ValueFunction:
     ) -> None:
         self._llm = llm
         self._config = config or ValueFunctionConfig()
-        # Updated by information_value; read by score() into ActionScore.
+        # Updated by their respective methods; read by score() into
+        # ActionScore. Tracked per-term (not inferred from which terms
+        # are enabled) so a future retry addition to any one of these
+        # doesn't silently make an inferred count wrong — same rationale
+        # as information_value's counter, now applied to the other three
+        # LLM-calling terms too (long_term_value and time_cost never
+        # call the LLM, so they have no counter).
         self._last_info_call_count: int = 0
+        self._last_learning_value_call_count: int = 0
+        self._last_cognitive_cost_call_count: int = 0
+        self._last_frustration_risk_call_count: int = 0
 
     @property
     def config(self) -> ValueFunctionConfig:
@@ -120,6 +129,7 @@ class ValueFunction:
         hypotheses: list[Hypothesis],
         concept_state: dict,
     ) -> float:
+        self._last_learning_value_call_count = 0
         prompt = (
             "SCORE:LEARNING_VALUE\n"
             f"action={action.action.value}\n"
@@ -131,7 +141,9 @@ class ValueFunction:
             "Estimate expected improvement in concept understanding, 0-1. "
             "Respond with a single float."
         )
-        return await self._ask_scalar(prompt)
+        value = await self._ask_scalar(prompt)
+        self._last_learning_value_call_count += 1
+        return value
 
     async def information_value(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
@@ -225,6 +237,7 @@ class ValueFunction:
     async def cognitive_cost(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
     ) -> float:
+        self._last_cognitive_cost_call_count = 0
         cog_hyps = [h for h in hypotheses if h.layer is Layer.COGNITIVE_STATE]
         prompt = (
             "SCORE:COGNITIVE_COST\n"
@@ -235,11 +248,14 @@ class ValueFunction:
             "Estimate the cognitive load this action imposes, 0-1. "
             "Respond with a single float."
         )
-        return await self._ask_scalar(prompt)
+        value = await self._ask_scalar(prompt)
+        self._last_cognitive_cost_call_count += 1
+        return value
 
     async def frustration_risk(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
     ) -> float:
+        self._last_frustration_risk_call_count = 0
         cog_hyps = [h for h in hypotheses if h.layer is Layer.COGNITIVE_STATE]
         prompt = (
             "SCORE:FRUSTRATION_RISK\n"
@@ -251,7 +267,9 @@ class ValueFunction:
             "Estimate risk of frustration, 0-1. "
             "Respond with a single float."
         )
-        return await self._ask_scalar(prompt)
+        value = await self._ask_scalar(prompt)
+        self._last_frustration_risk_call_count += 1
+        return value
 
     async def score(
         self,
@@ -266,6 +284,9 @@ class ValueFunction:
             await self.learning_value(action, active, concept_state)
             if cfg.enable_learning_value
             else 0.0
+        )
+        lv_calls = (
+            self._last_learning_value_call_count if cfg.enable_learning_value else 0
         )
         iv = (
             await self.information_value(action, active)
@@ -286,10 +307,18 @@ class ValueFunction:
             if cfg.enable_cognitive_cost
             else 0.0
         )
+        cc_calls = (
+            self._last_cognitive_cost_call_count if cfg.enable_cognitive_cost else 0
+        )
         fr = (
             await self.frustration_risk(action, active)
             if cfg.enable_frustration_risk
             else 0.0
+        )
+        fr_calls = (
+            self._last_frustration_risk_call_count
+            if cfg.enable_frustration_risk
+            else 0
         )
 
         total = lv + iv + ltv - tc - cc - fr
@@ -307,7 +336,10 @@ class ValueFunction:
             cognitive_cost=cc,
             frustration_risk=fr,
             total=total,
+            learning_value_call_count=lv_calls,
             information_value_call_count=iv_calls,
+            cognitive_cost_call_count=cc_calls,
+            frustration_risk_call_count=fr_calls,
             flags=flags,
         )
 
