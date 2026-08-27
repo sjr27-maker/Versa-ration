@@ -67,7 +67,10 @@ DIAGNOSE_MISMATCH_THRESHOLD = 0.4
 # output_json (llm_call_count, covering GroundConcept + MismatchDetector),
 # Infer.last_call_count, Plan.last_generate_call_count, each candidate's
 # ActionScore (learning_value/information_value/cognitive_cost/
-# frustration_risk_call_count), and Teach.last_call_count. This is a
+# frustration_risk_call_count), Teach.last_call_count, and — when
+# branch_store is wired in — BranchResolve/BranchGenerate's own
+# call_count (HypothesisGenerator's speculative prediction tree; see
+# hypothesis_generator.py, opt-in and 0 when not configured). This is a
 # complete count, not a floor — verified against a real turn (28 real
 # LLM calls, 28 counted) after an earlier version of this guardrail only
 # summed Diagnose + information_value and silently undercounted by 4x.

@@ -62,6 +62,46 @@ _DEFAULT_CONCEPT_BATCH = json.dumps(
 )
 
 
+_DEFAULT_INTENT_BRANCHES = json.dumps(
+    [
+        {
+            "statement": "wants to relate the new idea to something familiar",
+            "plausibility": 0.6,
+            "predicted_next_turn": "will ask for a real-world analogy",
+        },
+        {
+            "statement": "is missing a prerequisite concept",
+            "plausibility": 0.5,
+            "predicted_next_turn": "will ask a clarifying question about an earlier concept",
+        },
+        {
+            "statement": "is testing the tutor's explanation for correctness",
+            "plausibility": 0.3,
+            "predicted_next_turn": "will point out a perceived inconsistency",
+        },
+    ]
+)
+
+
+_DEFAULT_EXPAND_BRANCHES = json.dumps(
+    {
+        "layer_label": "knowledge_gap",
+        "children": [
+            {
+                "statement": "may be missing the underlying definition",
+                "plausibility": 0.5,
+                "predicted_next_turn": "will ask what the term actually means",
+            },
+            {
+                "statement": "may be conflating this with a related but different concept",
+                "plausibility": 0.4,
+                "predicted_next_turn": "will describe the related concept instead",
+            },
+        ],
+    }
+)
+
+
 _DEFAULT_RESPONSES: dict[str, str] = {
     # Existing loop nodes.
     "INFER:": "[]",
@@ -82,6 +122,12 @@ _DEFAULT_RESPONSES: dict[str, str] = {
     "SCORE:FRUSTRATION_RISK": "0.2",
     "SCORE:INFO_RESPONSES": "[]",
     "SCORE:INFO_UPDATE": "{}",
+    # HypothesisGenerator's speculative prediction tree.
+    "GENERATE:INTENT": _DEFAULT_INTENT_BRANCHES,
+    "GENERATE:EXPAND": _DEFAULT_EXPAND_BRANCHES,
+    # Conservative default: no match, so resolve() doesn't fabricate a
+    # match unless a test opts in — same convention as MISMATCH/GROUND.
+    "RESOLVE:MATCH": json.dumps({"matched_branch_id": None, "confidence": 0.0}),
 }
 
 
@@ -239,6 +285,45 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
     },
     "SCORE:INFO_UPDATE": _JSON_ONLY,
     "TEACH:": _FREE_TEXT,
+    "GENERATE:INTENT": {
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "statement": {"type": "STRING"},
+                "plausibility": {"type": "NUMBER"},
+                "predicted_next_turn": {"type": "STRING"},
+            },
+            "required": ["statement", "plausibility", "predicted_next_turn"],
+        },
+    },
+    "GENERATE:EXPAND": {
+        "type": "OBJECT",
+        "properties": {
+            "layer_label": {"type": "STRING"},
+            "children": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "statement": {"type": "STRING"},
+                        "plausibility": {"type": "NUMBER"},
+                        "predicted_next_turn": {"type": "STRING"},
+                    },
+                    "required": ["statement", "plausibility", "predicted_next_turn"],
+                },
+            },
+        },
+        "required": ["layer_label", "children"],
+    },
+    "RESOLVE:MATCH": {
+        "type": "OBJECT",
+        "properties": {
+            "matched_branch_id": {"type": "STRING", "nullable": True},
+            "confidence": {"type": "NUMBER"},
+        },
+        "required": ["confidence"],
+    },
 }
 
 

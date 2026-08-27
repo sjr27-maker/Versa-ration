@@ -5,6 +5,7 @@ import pytest
 import pytest_asyncio
 
 from probe.audit import NodeCallStore, TranscriptStore
+from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.learner import LearnerStore
@@ -36,6 +37,8 @@ async def pool():
         # tests only — the stores themselves must never remove rows
         # (CLAUDE.md invariants 1 and 2).
         await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS branches CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS branch_generations CASCADE")
         await conn.execute("DROP TABLE IF EXISTS world_model_revision_evidence CASCADE")
         await conn.execute("DROP TABLE IF EXISTS world_model_revisions CASCADE")
         await conn.execute("DROP TABLE IF EXISTS hypothesis_concepts CASCADE")
@@ -48,6 +51,7 @@ async def pool():
         await conn.execute("DROP TABLE IF EXISTS concept_prerequisites CASCADE")
         await conn.execute("DROP TABLE IF EXISTS concept_nodes CASCADE")
         await conn.execute("DROP TABLE IF EXISTS concept_graphs CASCADE")
+        await conn.execute("DROP TYPE IF EXISTS branch_status")
         await conn.execute("DROP TYPE IF EXISTS revision_status")
         await conn.execute("DROP TYPE IF EXISTS overlay_state")
         await conn.execute("DROP TYPE IF EXISTS evidence_polarity")
@@ -68,7 +72,7 @@ async def clean_pool(pool):
             "TRUNCATE node_calls, turns, sessions, learners, evidence_refs, "
             "hypotheses, learner_overlay, concept_prerequisites, concept_nodes, "
             "concept_graphs, hypothesis_concepts, world_model_revisions, "
-            "world_model_revision_evidence "
+            "world_model_revision_evidence, branches, branch_generations "
             "RESTART IDENTITY CASCADE"
         )
     return pool
@@ -102,6 +106,11 @@ async def learner_overlay(clean_pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def revision_store(clean_pool):
     return WorldModelRevisionStore(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def branch_store(clean_pool):
+    return BranchStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")

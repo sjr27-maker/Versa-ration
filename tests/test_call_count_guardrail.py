@@ -14,7 +14,7 @@ import pytest
 
 from probe.llm import StubLLMClient
 from probe.loop import SessionLoop
-from probe.models import Hypothesis, Layer, Tier
+from probe.models import EvidenceRef, Hypothesis, Layer, Polarity, Tier
 from probe.nodes import MAX_CALLS_PER_TURN
 
 # Three simulated responses per information_value call (instead of the
@@ -43,8 +43,16 @@ async def test_turn_exceeding_max_calls_per_turn_logs_a_warning_and_still_comple
     revision_store,
     caplog,
 ):
+    # Replan's entropy is learner-scoped (list_by_learner), so each
+    # hypothesis needs evidence tying it to this learner's own session
+    # before Replan will count it — a bare store.add() with no evidence
+    # isn't attributable to anyone.
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    seed_turn_id = await transcript.record_turn(
+        session_id, 0, "seed turn establishing prior hypotheses"
+    )
     for _ in range(8):
-        await store.add(
+        hyp = await store.add(
             Hypothesis(
                 layer=Layer.KNOWLEDGE,
                 statement="hedge",
@@ -52,6 +60,12 @@ async def test_turn_exceeding_max_calls_per_turn_logs_a_warning_and_still_comple
                 confidence=0.5,
                 tier=Tier.ACTIVE,
             )
+        )
+        await store.reweight(
+            hyp.id,
+            0.5,
+            0.5,
+            EvidenceRef(turn_id=seed_turn_id, polarity=Polarity.SUPPORTING),
         )
     llm = StubLLMClient(canned={"SCORE:INFO_RESPONSES": _CANNED_INFO_RESPONSES})
     loop = SessionLoop(
@@ -63,10 +77,9 @@ async def test_turn_exceeding_max_calls_per_turn_logs_a_warning_and_still_comple
         revision_store=revision_store,
         llm=llm,
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
 
     with caplog.at_level(logging.WARNING, logger="probe.loop"):
-        message = await loop.handle_turn(session_id, 0, "turn zero")
+        message = await loop.handle_turn(session_id, 1, "turn one")
 
     assert message  # the turn completed; nothing was truncated to dodge the ceiling
     warnings = [r.getMessage() for r in caplog.records if "MAX_CALLS_PER_TURN" in r.message]

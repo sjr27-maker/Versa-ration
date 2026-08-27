@@ -18,6 +18,8 @@ from uuid import UUID, uuid4
 import asyncpg
 from pydantic import BaseModel
 
+from probe.models import TurnRecord
+
 
 def to_jsonable(value: Any) -> Any:
     """Convert a value into a form json.dumps() can handle.
@@ -115,6 +117,24 @@ class TranscriptStore:
                 text,
             )
         return turn_id
+
+    async def list_turns(self, session_id: UUID) -> list[TurnRecord]:
+        """All of a session's student turns, chronological.
+
+        Used by HypothesisGenerator's transcript_context — full session
+        history, not just the most recent message.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, session_id, turn_index, text, created_at
+                FROM turns
+                WHERE session_id = $1
+                ORDER BY turn_index
+                """,
+                session_id,
+            )
+        return [TurnRecord(**dict(row)) for row in rows]
 
 
 class NodeCallStore:

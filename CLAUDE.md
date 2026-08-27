@@ -122,3 +122,35 @@ just learner-facing ones. Deleting a resolved revision would erase the
 record of what was proposed, what a human decided about it, and why —
 exactly the trail that makes a rejected-but-plausible claim or an
 approved edit's justification recoverable later.
+
+### 6. The branch store is append-only
+
+`BranchStore` (`branches`/`branch_generations`) must never delete rows.
+Concretely:
+
+- No `delete` / `remove` methods on the class.
+- No `DELETE` SQL anywhere in the `branches` module or its migrations.
+- Resolution is modeled by moving a branch's `status` from `open` to
+  `matched`, `unmatched`, or `superseded` via UPDATE, not by removing
+  it. A generation that turned out to predict nothing right stays on
+  record as `unmatched`, not as if it had never been generated.
+- Verified by the same AST-based check used for invariants 1 and 4.
+
+This is a separate invariant from #1, not a restatement of it: the
+rationale is different, so it gets its own entry rather than being
+folded into the hypothesis-store rule.
+
+Why: `HypothesisGenerator` rebuilds a speculative prediction tree every
+turn and discards most of it — but "discard" means retiring branches to
+a terminal status, the same way a hypothesis retires to `archived`
+rather than disappearing, not erasing the record that a generation
+happened and what it predicted. Crucially, this store does **not**
+write into `HypothesisStore`: a branch match is a single-turn,
+episodic signal, and probe's premise (invariant 1) is auditing
+*confirmed*, evidence-backed belief — promoting a branch into a real
+`Hypothesis` on one coincidental match would let episodic noise
+corrupt that durable record. Only a future consolidation step (not
+built yet — deliberately deferred until real match data exists to
+define "a pattern that repeats") would ever bridge the two; until
+then, the wall between episodic branches and durable hypotheses is
+itself part of what this invariant protects.

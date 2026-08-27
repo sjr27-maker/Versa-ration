@@ -10,6 +10,7 @@ from uuid import UUID
 from dotenv import load_dotenv
 
 from probe.audit import NodeCallStore, TranscriptStore
+from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph, ConceptValidationError
 from probe.db import create_pool
 from probe.learner import LearnerStore
@@ -174,6 +175,7 @@ async def _chat(learner_spec: str, topic_spec: str, use_stub: bool) -> None:
             revision_store=WorldModelRevisionStore(pool),
             llm=tiers.fast,
             model_tier_clients=tiers,
+            branch_store=BranchStore(pool),
         )
         await loop.run_interactive(learner.id, graph_meta.id)
     finally:

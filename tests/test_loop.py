@@ -2,7 +2,7 @@ import pytest
 
 from probe.llm import StubLLMClient
 from probe.loop import SessionLoop
-from probe.models import Hypothesis, Layer, Tier
+from probe.models import EvidenceRef, Hypothesis, Layer, Polarity, Tier
 from probe.nodes import DEFAULT_GENERATION_WIDTH, Replan
 from probe.reasoning_budget import ReasoningBudgetConfig
 
@@ -70,9 +70,16 @@ async def test_replan_output_threads_into_next_turn_infer_input(
     revision_store,
 ):
     # Seed a hypothesis at p=0.5 so Replan's entropy computation is
-    # non-trivial and > DEFAULT_GENERATION_WIDTH on turn 0.
+    # non-trivial and > DEFAULT_GENERATION_WIDTH on turn 0. Replan's
+    # entropy is learner-scoped (list_by_learner), so each hypothesis
+    # needs evidence tying it to this learner's own session — a bare
+    # store.add() with no evidence isn't attributable to anyone.
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    seed_turn_id = await transcript.record_turn(
+        session_id, 0, "seed turn establishing prior hypotheses"
+    )
     for _ in range(6):
-        await store.add(
+        hyp = await store.add(
             Hypothesis(
                 layer=Layer.KNOWLEDGE,
                 statement="hedge",
@@ -80,6 +87,12 @@ async def test_replan_output_threads_into_next_turn_infer_input(
                 confidence=0.5,
                 tier=Tier.ACTIVE,
             )
+        )
+        await store.reweight(
+            hyp.id,
+            0.5,
+            0.5,
+            EvidenceRef(turn_id=seed_turn_id, polarity=Polarity.SUPPORTING),
         )
 
     loop = SessionLoop(
@@ -91,10 +104,9 @@ async def test_replan_output_threads_into_next_turn_infer_input(
         revision_store=revision_store,
         llm=StubLLMClient(),
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "turn zero")
     await loop.handle_turn(session_id, 1, "turn one")
+    await loop.handle_turn(session_id, 2, "turn two")
 
     async with clean_pool.acquire() as conn:
         infer_widths = await conn.fetch(
@@ -199,8 +211,17 @@ async def test_high_entropy_turn_runs_information_value_for_that_turns_plan(
     learner_overlay,
     revision_store,
 ):
+    # Replan's entropy is learner-scoped (list_by_learner), which
+    # requires each hypothesis to carry evidence traceable to this
+    # learner's own session — a bare store.add() with no evidence isn't
+    # attributable to anyone, so the session/turn must exist first and
+    # each hypothesis needs a reweight() pointing at it.
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    seed_turn_id = await transcript.record_turn(
+        session_id, 0, "seed turn establishing prior hypotheses"
+    )
     for _ in range(8):
-        await store.add(
+        hyp = await store.add(
             Hypothesis(
                 layer=Layer.KNOWLEDGE,
                 statement="hedge",
@@ -208,6 +229,12 @@ async def test_high_entropy_turn_runs_information_value_for_that_turns_plan(
                 confidence=0.5,
                 tier=Tier.ACTIVE,
             )
+        )
+        await store.reweight(
+            hyp.id,
+            0.5,
+            0.5,
+            EvidenceRef(turn_id=seed_turn_id, polarity=Polarity.SUPPORTING),
         )
     loop = SessionLoop(
         hypothesis_store=store,
@@ -218,8 +245,7 @@ async def test_high_entropy_turn_runs_information_value_for_that_turns_plan(
         revision_store=revision_store,
         llm=StubLLMClient(),
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
-    await loop.handle_turn(session_id, 0, "turn zero")
+    await loop.handle_turn(session_id, 1, "turn one")
 
     counts = await _plan_info_call_counts(clean_pool, session_id)
     assert counts
@@ -243,8 +269,15 @@ async def test_ablation_disabled_information_value_is_never_reenabled_by_budget(
     # High entropy: run_information_value would normally be True, but
     # the caller explicitly disabled the term for this whole ablation
     # run — Replan's per-turn suggestion must never override that.
+    # (See the high-entropy test above for why the hypotheses need
+    # evidence attributing them to this learner's session — Replan's
+    # entropy is learner-scoped.)
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    seed_turn_id = await transcript.record_turn(
+        session_id, 0, "seed turn establishing prior hypotheses"
+    )
     for _ in range(8):
-        await store.add(
+        hyp = await store.add(
             Hypothesis(
                 layer=Layer.KNOWLEDGE,
                 statement="hedge",
@@ -252,6 +285,12 @@ async def test_ablation_disabled_information_value_is_never_reenabled_by_budget(
                 confidence=0.5,
                 tier=Tier.ACTIVE,
             )
+        )
+        await store.reweight(
+            hyp.id,
+            0.5,
+            0.5,
+            EvidenceRef(turn_id=seed_turn_id, polarity=Polarity.SUPPORTING),
         )
     loop = SessionLoop(
         hypothesis_store=store,
@@ -263,8 +302,7 @@ async def test_ablation_disabled_information_value_is_never_reenabled_by_budget(
         llm=StubLLMClient(),
         value_function_config=ValueFunctionConfig(enable_information_value=False),
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
-    await loop.handle_turn(session_id, 0, "turn zero")
+    await loop.handle_turn(session_id, 1, "turn one")
 
     counts = await _plan_info_call_counts(clean_pool, session_id)
     assert counts

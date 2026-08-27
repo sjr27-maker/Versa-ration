@@ -322,3 +322,88 @@ class WorldModelRevision(BaseModel):
     applied_field_updates: dict[str, object] | None = None
     created_at: datetime = Field(default_factory=_utcnow)
     resolved_at: datetime | None = None
+
+
+class TurnRecord(BaseModel):
+    """One student turn, as persisted by TranscriptStore.record_turn."""
+
+    id: UUID
+    session_id: UUID
+    turn_index: int
+    text: str
+    created_at: datetime
+
+
+class BranchStatus(str, Enum):
+    OPEN = "open"
+    MATCHED = "matched"
+    UNMATCHED = "unmatched"
+    SUPERSEDED = "superseded"
+
+
+class Branch(BaseModel):
+    """One node in HypothesisGenerator's speculative prediction tree.
+
+    Distinct from `Hypothesis`: this is regenerated and mostly discarded
+    every turn, never written into `HypothesisStore` directly (see
+    CLAUDE.md invariant 6). `depth`/`depth_label` replace a fixed
+    intent/knowledge_gap/predicted_action enum because depth is
+    situational — a branch keeps expanding only while doing so would
+    still distinguish it from siblings and the turn's budget allows
+    (see `should_expand_branch`). `predicted_next_turn` is populated on
+    every branch at creation time, not just eventual leaves, so
+    whichever depth a branch stops at, it stays checkable against the
+    student's real next message — `statement` is that layer's own
+    semantic content (the intent, the knowledge gap), which is not
+    itself always concretely checkable the way a prediction has to be.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    parent_id: UUID | None = None
+    generation_id: UUID
+    session_id: UUID
+    turn_index: int
+    depth: int = Field(ge=0)
+    depth_label: str
+    statement: str
+    predicted_next_turn: str
+    plausibility: float = Field(ge=0.0, le=1.0)
+    is_leaf: bool
+    status: BranchStatus = BranchStatus.OPEN
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class BranchGenerationMeta(BaseModel):
+    """Identity of one full generation event — not its branches."""
+
+    id: UUID = Field(default_factory=uuid4)
+    session_id: UUID
+    turn_index: int
+    root_count: int
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class BranchGeneration(BaseModel):
+    """HypothesisGenerator.generate()'s return value.
+
+    `call_count` is embedded directly (same precedent as
+    `ActionScore`/Diagnose's dict) rather than tracked as a
+    side-channel instance attribute, so it survives automatically into
+    `node_calls.output_json` and SessionLoop's MAX_CALLS_PER_TURN sum
+    can read it straight off the return value.
+    """
+
+    generation: BranchGenerationMeta
+    branches: list[Branch]
+    call_count: int = 0
+
+
+class ResolutionResult(BaseModel):
+    """HypothesisGenerator.resolve()'s return value."""
+
+    session_id: UUID
+    turn_index: int
+    matched_branch_id: UUID | None
+    matched_chain: list[UUID] = Field(default_factory=list)
+    status: str  # "matched" | "unmatched"
+    call_count: int = 0
