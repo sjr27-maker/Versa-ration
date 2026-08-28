@@ -481,12 +481,22 @@ class Teach:
         path_block = ""
         if path_requirement is not None:
             path_block = (
-                "\nWhat the student appears to currently believe: "
+                "\nWhat the student appears to currently believe (this "
+                "is YOUR OWN inference, not a quote — the student did "
+                "not necessarily say this): "
                 f"{path_requirement.current_belief}\n"
                 "What they need from you this turn: "
                 f"{path_requirement.needed}\n"
                 "The scope of this turn's teaching — stay within this, "
                 f"one thing, not a syllabus: {path_requirement.scope}\n"
+                "Never use affirmation language — \"exactly\", \"that's "
+                "right\", \"yes\", \"as you said\", \"perfect way to "
+                "think about it\" — about anything that is not "
+                "literally present in the student's own message above. "
+                "You may address, build on, or gently correct an "
+                "inferred belief, but never credit the student with "
+                "having said or confirmed something themselves when "
+                "they did not.\n"
             )
             if path_requirement.must_not_assume:
                 must_not = "; ".join(path_requirement.must_not_assume)

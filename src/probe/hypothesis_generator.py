@@ -25,6 +25,7 @@ import asyncio
 import difflib
 import json
 import logging
+import re
 from uuid import UUID
 
 from probe.branches import BranchStore
@@ -326,10 +327,12 @@ def _parse_select_response(
     return candidate, rationale
 
 
-def _derive_prompt(path: list[Branch]) -> str:
+def _derive_prompt(
+    path: list[Branch], student_message: str, action_rationale: str
+) -> str:
     listing = "\n".join(
         f"- depth={b.depth} [{b.depth_label}]: {b.statement} "
-        f"(predicted reaction: {b.predicted_next_turn})"
+        f"(predicted future reaction, NOT YET SAID: {b.predicted_next_turn})"
         for b in path
     )
     return (
@@ -338,13 +341,34 @@ def _derive_prompt(path: list[Branch]) -> str:
         "be derived from, from the student's root-level intent down to "
         "the most specific selected branch.\n\n"
         f"{listing}\n\n"
-        "From this path, derive what this turn's teaching should do. Be "
-        "precise about what the path actually implies versus what is "
-        "merely possible — do not invent specifics (values, signs, "
-        "conditions) the path does not state.\n"
-        'Respond with JSON: {"current_belief": "what the student appears '
-        'to currently believe, based on this path", "needed": "what they '
-        'must be given to move along this path", "must_not_assume": '
+        "The student's actual message, verbatim, is the only thing they "
+        f"have actually said so far:\n{student_message}\n\n"
+        "The tutor is considering teaching this, but has NOT taught it "
+        f"yet — the student has no knowledge of it: {action_rationale}\n\n"
+        "IMPORTANT — read this carefully before answering. Each "
+        "\"predicted future reaction\" above is a HYPOTHETICAL guess "
+        "about what the student MIGHT say LATER, after being taught "
+        "something they have not been taught yet. It has NOT happened. "
+        "It is not evidence of the student's current state, only a "
+        "forecast. Likewise, the tutor's own not-yet-taught idea above "
+        "is not something the student could already believe anything "
+        "about — they cannot hold a belief about an analogy or "
+        "explanation they have never heard.\n\n"
+        "current_belief must be built ONLY from what is actually known: "
+        "the student's real message above, the root intent's own "
+        "statement, and any ancestor branch statement that describes the "
+        "student's EXISTING state (not a predicted reaction, and not the "
+        "tutor's own not-yet-taught idea). If none of that actually "
+        "supports a specific belief claim, say so plainly — e.g. "
+        "\"insufficient evidence to characterize current belief beyond "
+        "the root intent\" — rather than manufacturing one. A true "
+        "\"not enough evidence\" is a correct, useful answer here, not a "
+        "failure to avoid.\n\n"
+        "Beyond that: be precise about what the path actually implies "
+        "versus what is merely possible — do not invent specifics "
+        "(values, signs, conditions) the path does not state.\n"
+        'Respond with JSON: {"current_belief": "...", "needed": "what '
+        'they must be given to move along this path", "must_not_assume": '
         '["...", ...] (things this path leaves genuinely uncertain that '
         'must NOT be stated as settled), "scope": "the concrete scope of '
         'this turn of teaching — one thing, not a syllabus"}'
@@ -971,14 +995,78 @@ class DerivePath:
     PathRequirement (all blank/empty fields) rather than raising —
     Teach then simply gets less scoping, the same graceful-degradation
     discipline as a missing topic did before this feature existed.
+
+    `student_message`/`action_rationale` exist specifically so the
+    prompt can draw a hard line between what's actually known (the
+    student's real words) and what's merely predicted or not-yet-taught
+    (a branch's predicted_next_turn, the tutor's own proposed idea) —
+    see the exact failure this guards against in _derive_prompt's
+    docstring-equivalent comments: a predicted *future* reaction being
+    promoted into a stated *current* belief, which Teach then
+    unwittingly affirms as something the student already said.
     """
 
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
         self.last_call_count: int = 0
 
-    async def run(self, path: list[Branch]) -> PathRequirement:
+    async def run(
+        self, path: list[Branch], student_message: str, action_rationale: str
+    ) -> PathRequirement:
         self.last_call_count = 0
-        raw = await self._llm.complete(_derive_prompt(path))
+        raw = await self._llm.complete(
+            _derive_prompt(path, student_message, action_rationale)
+        )
         self.last_call_count += 1
         return _parse_path_requirement(raw)
+
+
+# Words too generic to count as "content" for check_current_belief_leak
+# — without filtering these, almost any two sentences about the same
+# topic would share enough of them to produce false positives.
+_BELIEF_CHECK_STOPWORDS = frozenset(
+    {
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "to", "of", "in", "on", "at", "by", "for", "with", "about", "as",
+        "that", "this", "these", "those", "it", "its", "and", "or", "but",
+        "student", "believes", "belief", "appears", "currently", "their",
+        "they", "them", "has", "have", "had", "not", "no", "if", "so",
+        "will", "would", "can", "could", "does", "do", "did", "than",
+        "into", "from", "which", "what", "how", "when", "where", "who",
+    }
+)
+
+
+def _content_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w for w in words if len(w) > 3 and w not in _BELIEF_CHECK_STOPWORDS}
+
+
+def check_current_belief_leak(
+    current_belief: str,
+    predicted_next_turn: str,
+    action_rationale: str,
+    student_message: str,
+) -> bool:
+    """A structural backstop for DerivePath's own prompt instructions,
+    not a replacement for them: prompts drift, this catches what one
+    misses. True when current_belief shares distinctive vocabulary with
+    the selected branch's predicted_next_turn or the proposed action's
+    rationale — content that has not actually happened yet — while
+    sharing none with what the student actually said. This is a
+    heuristic (word overlap, not semantic understanding), same
+    "flag for a human to judge" spirit as the redundancy check's own
+    wording-not-semantics caveat — it does not prove a leak occurred,
+    it flags a pattern worth a human's attention in turn_diagnostics.
+    """
+    belief_words = _content_words(current_belief)
+    if not belief_words:
+        return False
+    unconfirmed_words = _content_words(predicted_next_turn) | _content_words(
+        action_rationale
+    )
+    message_words = _content_words(student_message)
+
+    leaked = belief_words & unconfirmed_words
+    grounded = belief_words & message_words
+    return bool(leaked) and not grounded

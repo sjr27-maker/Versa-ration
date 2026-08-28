@@ -121,3 +121,33 @@ async def test_options_lead_in_bans_self_report_and_labeling():
     assert "self-report" in prompt
     assert "do not just stop flatly" in prompt.lower()
     assert 'call them "options' in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_prompt_bans_affirmation_language_about_unstated_current_belief():
+    """Regression for the exact live failure: DerivePath's current_belief
+    described a reaction to an analogy ("roommates sharing a
+    whiteboard") the student never mentioned, and Teach opened with
+    "Exactly, that is a perfect way to visualize it..." -- affirming
+    content as if the student had said it. current_belief is Teach's
+    OWN inference, never a quote, and the prompt must say so and ban
+    the exact affirmation phrasing that caused this."""
+    path_requirement = PathRequirement(
+        current_belief=(
+            "The student believes the whiteboard analogy translates to "
+            "roommates acting as processors sharing memory."
+        ),
+        needed="confirmation of the analogy",
+        must_not_assume=[],
+        scope="shared memory architecture",
+    )
+    llm = StubLLMClient()
+    teach = Teach(llm)
+
+    await teach.run(_action(), "what is parallel computing", path_requirement)
+
+    prompt = llm.prompts[-1]
+    assert "not a quote" in prompt.lower()
+    assert '"exactly"' in prompt.lower()
+    assert "as you said" in prompt.lower()
+    assert "never credit the student with having said" in prompt.lower()

@@ -126,6 +126,7 @@ from probe.hypothesis_generator import (
     HypothesisGenerator,
     SelectBranch,
     build_branch_path,
+    check_current_belief_leak,
 )
 from probe.llm import LLMClient, ModelTierClients
 from probe.mismatch import MismatchDetector
@@ -642,6 +643,7 @@ class SessionLoop:
         # to gate on.
         generation_call_count = 0
         path_requirement = None
+        current_belief_unsupported = False
         option_texts: list[str] = []
         if self.branch_generate is not None:
             transcript_context = await self._build_transcript_context(
@@ -728,6 +730,8 @@ class SessionLoop:
                                 None,
                                 warnings,
                                 path=path,
+                                student_message=turn_text,
+                                action_rationale=plan_output.winner.rationale,
                             )
                             if path_result is not None:
                                 node_call_counts["DerivePath"] = (
@@ -737,6 +741,31 @@ class SessionLoop:
                                 await self._branch_store.set_path_requirement(
                                     generation.generation.id, path_requirement
                                 )
+                                # Structural backstop, not a replacement
+                                # for DerivePath's own prompt
+                                # instructions: catches a predicted
+                                # *future* reaction (or the tutor's own
+                                # not-yet-taught idea) being promoted
+                                # into a stated *current* belief, which
+                                # Teach would otherwise unwittingly
+                                # affirm as something the student
+                                # already said.
+                                selected_branch = path[-1] if path else None
+                                if selected_branch is not None and check_current_belief_leak(
+                                    path_requirement.current_belief,
+                                    selected_branch.predicted_next_turn,
+                                    plan_output.winner.rationale,
+                                    turn_text,
+                                ):
+                                    current_belief_unsupported = True
+                                    warnings.append(
+                                        "current_belief_unsupported: DerivePath's "
+                                        "current_belief shares content with the "
+                                        "predicted reaction or proposed action "
+                                        "rationale but nothing the student "
+                                        "actually said — Teach may be about to "
+                                        "affirm something as said that wasn't"
+                                    )
 
         # Teach has no fallback — its output *is* the turn. A failure
         # here doesn't crash the turn or the session, but there's no
@@ -847,6 +876,7 @@ class SessionLoop:
                     topic_seeded_new=topic_seeded_new,
                     retry_count=_total_retry_count(self._tiers) - retry_count_start,
                     options_missed=options_missed,
+                    current_belief_unsupported=current_belief_unsupported,
                 )
             )
 

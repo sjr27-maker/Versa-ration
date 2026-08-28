@@ -644,6 +644,14 @@ class TurnDiagnostics(BaseModel):
     # _build_transcript_context) and surfaced prominently in the web
     # UI's Diagnostics panel.
     options_missed: bool = False
+    # True when hypothesis_generator.check_current_belief_leak flagged
+    # this turn's DerivePath output — current_belief shared distinctive
+    # vocabulary with the selected branch's predicted_next_turn or the
+    # proposed action's rationale (content that had NOT happened yet)
+    # while sharing none with the student's actual message. A
+    # structural backstop for DerivePath's own prompt instructions, not
+    # proof a leak occurred — see check_current_belief_leak's docstring.
+    current_belief_unsupported: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
 
 

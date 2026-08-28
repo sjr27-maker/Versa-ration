@@ -133,7 +133,11 @@ async def test_derive_path_produces_non_empty_must_not_assume_for_unstated_quant
     )
     node = DerivePath(StubLLMClient(canned={"DERIVE:PATH": canned_response}))
 
-    result = await node.run(path)
+    result = await node.run(
+        path,
+        student_message="I don't know if the force is attractive or repulsive",
+        action_rationale="explain force direction via Coulomb's law",
+    )
 
     assert result.must_not_assume  # non-empty
     assert "sign" in result.must_not_assume[0].lower()
@@ -147,7 +151,7 @@ async def test_derive_path_degrades_gracefully_on_unparseable_response():
     branch = _branch("a", 0.5, generation_id, session_id)
     node = DerivePath(StubLLMClient(canned={"DERIVE:PATH": "not json"}))
 
-    result = await node.run([branch])
+    result = await node.run([branch], student_message="message", action_rationale="r")
 
     assert result.must_not_assume == []
     assert result.current_belief == ""
@@ -179,3 +183,94 @@ def test_build_branch_path_for_a_root_branch_is_just_itself():
     path = build_branch_path([root], root.id)
 
     assert path == [root]
+
+
+# --- Regression: predicted reaction promoted into a stated belief ------
+#
+# Real failure: the selected root branch's predicted_next_turn was "That
+# whiteboard idea makes sense, so are the roommates acting like
+# processors sharing the same memory?" -- a HYPOTHETICAL future reaction
+# to an analogy Plan proposed but had not yet taught. DerivePath turned
+# this into current_belief: "The student believes the whiteboard analogy
+# translates to roommates acting as processors..." -- stated as settled
+# fact. Teach then affirmed it ("Exactly, that's a perfect way to
+# visualize it...") as if the student had said it, when they never had.
+
+
+@pytest.mark.asyncio
+async def test_derive_prompt_marks_predicted_reaction_as_hypothetical_not_happened():
+    generation_id, session_id = uuid4(), uuid4()
+    root = _branch(
+        "wants a high-level overview of parallel computing", 0.5,
+        generation_id, session_id,
+    )
+    root.predicted_next_turn = (
+        "That whiteboard idea makes sense, so are the roommates acting "
+        "like processors sharing the same memory?"
+    )
+    llm = StubLLMClient()
+    node = DerivePath(llm)
+
+    await node.run(
+        [root],
+        student_message="what is parallel computing",
+        action_rationale=(
+            "An analogy of roommates sharing a kitchen whiteboard helps "
+            "explain shared memory architecture."
+        ),
+    )
+
+    prompt = llm.prompts[-1]
+    assert "predicted future reaction, NOT YET SAID" in prompt
+    assert "has NOT happened" in prompt
+    assert "hypothetical" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_derive_prompt_warns_against_crediting_untaught_action_content():
+    generation_id, session_id = uuid4(), uuid4()
+    root = _branch("wants an overview", 0.5, generation_id, session_id)
+    llm = StubLLMClient()
+    node = DerivePath(llm)
+
+    await node.run(
+        [root],
+        student_message="what is parallel computing",
+        action_rationale="roommates sharing a kitchen whiteboard analogy",
+    )
+
+    prompt = llm.prompts[-1]
+    assert "has NOT taught it yet" in prompt
+    assert "roommates sharing a kitchen whiteboard analogy" in prompt
+    assert "cannot hold a belief" in prompt.lower() or "cannot already believe" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_derive_prompt_offers_insufficient_evidence_as_a_legitimate_answer():
+    generation_id, session_id = uuid4(), uuid4()
+    root = _branch("wants an overview", 0.5, generation_id, session_id)
+    llm = StubLLMClient()
+    node = DerivePath(llm)
+
+    await node.run([root], student_message="what is parallel computing", action_rationale="r")
+
+    prompt = llm.prompts[-1]
+    assert "insufficient evidence to characterize current belief" in prompt
+    assert "not a failure to avoid" in prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_derive_prompt_includes_the_students_actual_message_verbatim():
+    generation_id, session_id = uuid4(), uuid4()
+    root = _branch("wants an overview", 0.5, generation_id, session_id)
+    llm = StubLLMClient()
+    node = DerivePath(llm)
+
+    await node.run(
+        [root],
+        student_message="what is parallel computing",
+        action_rationale="r",
+    )
+
+    prompt = llm.prompts[-1]
+    assert "what is parallel computing" in prompt

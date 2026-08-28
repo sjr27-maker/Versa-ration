@@ -385,6 +385,14 @@ with right:
                     "signal the branch/option set was wrong, not that the "
                     "student was uncooperative."
                 )
+            if diagnostics.current_belief_unsupported:
+                st.error(
+                    "⚠ current_belief_unsupported — DerivePath's current_belief "
+                    "shares content with the predicted reaction or proposed "
+                    "action rationale but nothing the student actually said. "
+                    "Teach may have affirmed something as said that wasn't — "
+                    "check this turn's tutor message."
+                )
             if diagnostics.warnings:
                 st.markdown("**Warnings**")
                 for w in diagnostics.warnings:
