@@ -191,3 +191,31 @@ either could be edited or pruned, "zero business logic in the UI"
 would quietly stop being true: a UI that can't trust the record to be
 complete has to start re-deriving things itself, which is exactly the
 failure mode this whole feature was built to avoid.
+
+### 8. The options store is append-only
+
+`OptionStore` (`options`) must never delete rows. Concretely:
+
+- No `delete` / `remove` methods on the class.
+- No `DELETE` SQL anywhere in the `options` module or its migrations.
+- Resolution is modeled by moving an option's `status` from `open` to
+  `selected` or `superseded` via UPDATE, not by removing it. An option
+  the student never clicked stays on record as `superseded`, not as if
+  it had never been offered.
+- Verified by the same AST-based check used for invariants 1, 4, 6,
+  and 7.
+
+This is a separate invariant from invariant 6, not a restatement of
+it: options and branches are different tables with different
+rationale, so it gets its own entry rather than being folded into the
+branch-store wording.
+
+Why: an option is the record of what was actually offered to the
+student and which claim they did or didn't affirm — the evidence trail
+for `Branch.evidence_satisfied`. Deleting a superseded option would
+erase proof that a specific, unambiguous choice was on the table and
+not taken, which is exactly the kind of fact CLAUDE.md invariant 1's
+"audit how beliefs evolved" premise depends on, extended to the
+options channel: an option is not written into `HypothesisStore`
+either (same wall as invariant 6 describes for branches) — it only
+ever flips `evidence_satisfied` on the branch it maps to.

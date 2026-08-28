@@ -11,7 +11,7 @@ import streamlit as st
 
 from probe.hypothesis_generator import build_branch_path
 from probe.loop import SessionLoop
-from probe.models import BranchStatus, Tier
+from probe.models import BranchStatus, OptionStatus, Tier
 from probe.nodes import MAX_CALLS_PER_TURN, SessionMissingTopicError
 from probe.webui.backend import (
     get_stores,
@@ -55,6 +55,7 @@ if (
         llm=tiers.fast,
         model_tier_clients=tiers,
         branch_store=stores.branches,
+        option_store=stores.options,
         diagnostics_store=stores.diagnostics,
         on_node_start=on_node_start,
     )
@@ -89,6 +90,33 @@ st.caption(
 
 left, right = st.columns([3, 2])
 
+def _run_turn(text: str, progress_placeholder, selected_option_id=None) -> None:
+    """Shared by typed input and option-button clicks — both are just
+    a message plus, for a click, which option produced it. A click's
+    `text` is that option's own label: the click IS the turn's
+    content, recorded exactly like typed text would be."""
+    turn_index = st.session_state.get("turn_index", 0)
+    progress["node"] = None
+    progress_placeholder.markdown("⏳ starting…")
+    try:
+        message = run_turn_with_progress(
+            loop.handle_turn(session_id, turn_index, text, selected_option_id),
+            progress,
+            progress_placeholder,
+        )
+    except SessionMissingTopicError as exc:
+        st.error(f"Session has no topic attached: {exc}")
+    except Exception as exc:  # noqa: BLE001 — surfaced to the user, not swallowed
+        st.error(f"Turn failed: {exc}")
+    else:
+        st.session_state["chat_history"].append(("student", text))
+        st.session_state["chat_history"].append(("tutor", message))
+        st.session_state["turn_index"] = turn_index + 1
+    finally:
+        progress_placeholder.empty()
+    st.rerun()
+
+
 with left:
     st.subheader("Conversation")
     chat_box = st.container(height=480)
@@ -97,29 +125,33 @@ with left:
             with st.chat_message("user" if role == "student" else "assistant"):
                 st.write(text)
 
+    # Options pending from the most recent turn's generation — both
+    # channels stay enabled: clicking one here satisfies its branch
+    # directly (no LLM call); typing in the box below instead still
+    # gets a chance via CheckEvidence. Only ever the *latest*
+    # generation's still-open options: resolve() supersedes whatever's
+    # left the moment the next turn starts, on either path.
+    pending_options = []
+    latest_generation_for_options = run_async(
+        stores.branches.get_latest_generation(session_id)
+    )
+    if latest_generation_for_options is not None:
+        all_options = run_async(
+            stores.options.list_by_generation(latest_generation_for_options.id)
+        )
+        pending_options = [o for o in all_options if o.status is OptionStatus.OPEN]
+
     progress_placeholder = st.empty()
+
+    if pending_options:
+        option_cols = st.columns(len(pending_options))
+        for col, option in zip(option_cols, pending_options, strict=True):
+            if col.button(option.text, key=f"option-{option.id}", use_container_width=True):
+                _run_turn(option.text, progress_placeholder, selected_option_id=option.id)
+
     user_text = st.chat_input("Say something…")
     if user_text:
-        turn_index = st.session_state.get("turn_index", 0)
-        progress["node"] = None
-        progress_placeholder.markdown("⏳ starting…")
-        try:
-            message = run_turn_with_progress(
-                loop.handle_turn(session_id, turn_index, user_text),
-                progress,
-                progress_placeholder,
-            )
-        except SessionMissingTopicError as exc:
-            st.error(f"Session has no topic attached: {exc}")
-        except Exception as exc:  # noqa: BLE001 — surfaced to the user, not swallowed
-            st.error(f"Turn failed: {exc}")
-        else:
-            st.session_state["chat_history"].append(("student", user_text))
-            st.session_state["chat_history"].append(("tutor", message))
-            st.session_state["turn_index"] = turn_index + 1
-        finally:
-            progress_placeholder.empty()
-        st.rerun()
+        _run_turn(user_text, progress_placeholder)
 
 latest_turn_index = st.session_state.get("turn_index", 0) - 1
 
@@ -179,8 +211,17 @@ with right:
         )
         if resolution_call is not None:
             status = resolution_call.output_json.get("status")
+            source = resolution_call.output_json.get("source")
             if status == "matched":
-                st.success("Previous turn: MATCHED")
+                # Distinct labels on purpose: a click confirms the student
+                # picked an offered option, not that the system predicted
+                # them — these must never read as the same kind of "right."
+                label = (
+                    "MATCHED (option click)"
+                    if source == "option_click"
+                    else "MATCHED (predicted)"
+                )
+                st.success(f"Previous turn: {label}")
             elif status == "unmatched":
                 st.error("⚠ Previous turn: NOTHING MATCHED")
 
@@ -192,6 +233,13 @@ with right:
             by_parent: dict = {}
             for b in branches:
                 by_parent.setdefault(b.parent_id, []).append(b)
+
+            options_for_generation = run_async(
+                stores.options.list_by_generation(generation.id)
+            )
+            option_text_by_branch = {
+                o.branch_id: o.text for o in options_for_generation
+            }
 
             status_marker = {
                 BranchStatus.MATCHED: "✅",
@@ -206,15 +254,31 @@ with right:
                     prefix = "  " * indent
                     weight = "**" if b.depth == 0 else ""
                     star = "⭐ " if b.id == selected_id else ""
+                    awaiting = b.requires_evidence and not b.evidence_satisfied
+                    evidence_marker = "⏳ " if awaiting else ("🔓 " if b.requires_evidence else "")
                     st.markdown(
-                        f"{prefix}{status_marker[b.status]} {star}{weight}[{b.depth_label}] "
-                        f"{b.statement}{weight}  \n"
+                        f"{prefix}{status_marker[b.status]} {star}{evidence_marker}"
+                        f"{weight}[{b.depth_label}] {b.statement}{weight}  \n"
                         f"{prefix}　plausibility={b.plausibility:.2f} · "
                         f"predicts: _{b.predicted_next_turn}_"
                     )
+                    if b.requires_evidence:
+                        st.caption(
+                            f"{prefix}　requires: {b.requires_evidence}"
+                            + (
+                                f"  ·  option shown: “{option_text_by_branch[b.id]}”"
+                                if b.id in option_text_by_branch
+                                else ""
+                            )
+                        )
                     render(b.id, indent + 1)
 
             render(None, 0)
+            if any(b.requires_evidence and not b.evidence_satisfied for b in branches):
+                st.caption(
+                    "⏳ = awaiting evidence (held, not expanded)  ·  "
+                    "🔓 = evidence already satisfied"
+                )
 
             if selected_id is not None:
                 path = build_branch_path(branches, selected_id)
@@ -314,6 +378,13 @@ with right:
             st.json(diagnostics.node_call_counts)
             if diagnostics.teach_failed:
                 st.error("Teach failed this turn — no real teaching content was produced.")
+            if diagnostics.options_missed:
+                st.error(
+                    "⚠ options_missed — the student typed past the prior turn's "
+                    "options without satisfying any of them. Treat this as a "
+                    "signal the branch/option set was wrong, not that the "
+                    "student was uncooperative."
+                )
             if diagnostics.warnings:
                 st.markdown("**Warnings**")
                 for w in diagnostics.warnings:

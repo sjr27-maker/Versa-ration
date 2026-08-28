@@ -35,15 +35,23 @@ from probe.models import (
     BranchSelection,
     BranchStatus,
     CandidateAction,
+    EvidenceCheckResult,
     Hypothesis,
+    OptionProposal,
     PathRequirement,
     ResolutionResult,
 )
+from probe.options import OptionStore
 from probe.reasoning_budget import (
     BranchBudget,
     BranchBudgetConfig,
     compute_branch_budget,
 )
+
+# GENERATE:OPTIONS re-ask budget on a rejected mapping (duplicate
+# branch id, or a branch id outside the live set) — one corrective
+# retry, same shape as Plan's _MAX_PROPOSE_ATTEMPTS.
+_MAX_OPTIONS_ATTEMPTS = 2
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +72,24 @@ def should_expand_branch(
     depth: int,
     branches_so_far: int,
     budget: BranchBudget,
+    requires_evidence: str | None = None,
+    evidence_satisfied: bool = False,
 ) -> bool:
-    """The one explicit "worth expanding to the next layer" filter:
-    (a) plausible enough, (b) distinguishes from siblings rather than
-    restating them, (c) the turn's budget still permits it.
+    """The "worth expanding to the next layer" filter: (a) its
+    requires_evidence, if any, is satisfied, (b) plausible enough,
+    (c) distinguishes from siblings rather than restating them, (d) the
+    turn's budget still permits it.
 
-    No LLM call for (b): a text-similarity heuristic is enough since
+    Gate (a) is a hard block, not a plausibility adjustment: a branch
+    can be arbitrarily plausible and still not expand, because
+    expansion now depends on the student, not just the model's own
+    confidence (see Branch.requires_evidence). A branch that fails only
+    this gate is not pruned or superseded — it holds at its current
+    depth, unresolved, until a click or a typed match satisfies it (see
+    BranchStore.set_evidence_satisfied), then expands on a later turn
+    exactly as if it had never required evidence.
+
+    No LLM call for (c): a text-similarity heuristic is enough since
     near-duplicate branches from the same generation call tend to be
     near-duplicate text, and an extra call per decision would defeat
     the point of budgeting call count at all. This catches wording-
@@ -78,6 +98,8 @@ def should_expand_branch(
     judge from real session data whether survivors are genuinely
     distinct bets or rephrasings of one idea.
     """
+    if requires_evidence is not None and not evidence_satisfied:
+        return False
     if depth + 1 > budget.max_depth:
         return False
     if branches_so_far >= budget.max_total_branches:
@@ -100,7 +122,11 @@ def _clamp01(value: object) -> float:
 def _parse_branch_items(raw: str) -> list[dict]:
     """Shared parser for both a root-wave response (bare JSON list) and
     an expansion response's `children` list. Malformed/missing fields
-    are skipped, not fatal — same discipline as Infer/Plan's parsing."""
+    are skipped, not fatal — same discipline as Infer/Plan's parsing.
+
+    requires_evidence is optional and nullable: an empty string or
+    missing key both normalize to None (a branch that needs nothing
+    further), same as a JSON null would."""
     if not isinstance(raw, list):
         return []
     items: list[dict] = []
@@ -111,11 +137,15 @@ def _parse_branch_items(raw: str) -> list[dict]:
         predicted = entry.get("predicted_next_turn")
         if not statement or not predicted:
             continue
+        requires_evidence = entry.get("requires_evidence")
         items.append(
             {
                 "statement": str(statement),
                 "plausibility": _clamp01(entry.get("plausibility", 0.0)),
                 "predicted_next_turn": str(predicted),
+                "requires_evidence": (
+                    str(requires_evidence) if requires_evidence else None
+                ),
             }
         )
     return items
@@ -195,9 +225,15 @@ def _intent_prompt(
         "and how they are likely to react once the tutor's planned action "
         "happens — genuinely different bets, not rephrasings of one "
         "idea.\n\n"
+        "For each, also state requires_evidence: what would have to be "
+        "true about the student — in their own words or actions, not "
+        "your own confidence — for this branch to be worth exploring "
+        "deeper. Use null when the branch needs nothing further and can "
+        "expand on plausibility alone.\n\n"
         'Respond with JSON: [{"statement": "...", "plausibility": 0.0-1.0, '
         '"predicted_next_turn": "a concrete, checkable prediction of what '
-        'the student will say or do next if this intent is true"}, ...]'
+        'the student will say or do next if this intent is true", '
+        '"requires_evidence": "..." or null}, ...]'
     )
 
 
@@ -213,10 +249,15 @@ def _expand_prompt(parent: Branch, budget: BranchBudget) -> str:
         'parent. Also name a short label for what this new layer is '
         'branching (e.g. "knowledge_gap", "predicted_action", or whatever '
         "fits better here).\n\n"
+        "For each child, also state requires_evidence: what would have "
+        "to be true about the student for that child to be worth "
+        "exploring deeper still, or null if nothing further is "
+        "needed.\n\n"
         'Respond with JSON: {"layer_label": "...", "children": '
         '[{"statement": "...", "plausibility": 0.0-1.0, "predicted_next_turn": '
         '"a concrete, checkable prediction of what the student will say or '
-        'do next if this branch is true"}, ...]}'
+        'do next if this branch is true", "requires_evidence": "..." or '
+        'null}, ...]}'
     )
 
 
@@ -353,10 +394,16 @@ class HypothesisGenerator:
         llm: LLMClient,
         branch_store: BranchStore,
         budget_config: BranchBudgetConfig | None = None,
+        option_store: OptionStore | None = None,
     ) -> None:
         self._llm = llm
         self._branches = branch_store
         self._budget_config = budget_config
+        # Opt-in on top of branch_store's own opt-in: option_store=None
+        # (the default) reproduces the tree without the button channel
+        # — resolve() simply skips option supersession. See
+        # GenerateOptions/CheckEvidence for the rest of this feature.
+        self._options = option_store
 
     async def generate(
         self,
@@ -403,6 +450,7 @@ class HypothesisGenerator:
                 depth_label="intent",
                 statement=item["statement"],
                 predicted_next_turn=item["predicted_next_turn"],
+                requires_evidence=item["requires_evidence"],
                 plausibility=item["plausibility"],
                 is_leaf=True,  # provisional; flipped False below if expanded
             )
@@ -431,6 +479,8 @@ class HypothesisGenerator:
                     depth,
                     len(all_branches),
                     budget,
+                    requires_evidence=branch.requires_evidence,
+                    evidence_satisfied=branch.evidence_satisfied,
                 )
                 if survives:
                     note = (
@@ -481,6 +531,7 @@ class HypothesisGenerator:
                             depth_label=layer_label,
                             statement=item["statement"],
                             predicted_next_turn=item["predicted_next_turn"],
+                            requires_evidence=item["requires_evidence"],
                             plausibility=item["plausibility"],
                             is_leaf=True,
                         )
@@ -499,9 +550,40 @@ class HypothesisGenerator:
             redundancy_notes=redundancy_notes,
         )
 
+    async def _mark_matched_chain(
+        self, branch_id: UUID, matched_via: str
+    ) -> list[UUID]:
+        """Marks `branch_id` and its full ancestor chain matched, all
+        via the same channel — shared by both the click path and the
+        text-match path below so a branch ends up in an identical
+        shape regardless of which one resolved it, aside from
+        matched_via itself."""
+        matched_chain = [branch_id]
+        await self._branches.set_matched(branch_id, matched_via)
+        for ancestor in await self._branches.get_ancestors(branch_id):
+            await self._branches.set_matched(ancestor.id, matched_via)
+            matched_chain.append(ancestor.id)
+        return matched_chain
+
     async def resolve(
-        self, session_id: UUID, turn_index: int, actual_turn_text: str
+        self,
+        session_id: UUID,
+        turn_index: int,
+        actual_turn_text: str,
+        clicked_branch_id: UUID | None = None,
     ) -> ResolutionResult:
+        """`clicked_branch_id` is set only when this turn originated
+        from an option click (see SessionLoop.handle_turn) — a click
+        is settled evidence, categorically more certain than a text
+        match, so it bypasses RESOLVE:MATCH's fuzzy LLM judgment
+        entirely rather than letting an uncertain step override a
+        known fact. The clicked branch is marked matched directly
+        (source="option_click", call_count=0); its non-clicked
+        siblings were never tested by this turn at all (the student
+        chose one path, they did not reject the others) so they're
+        superseded, not marked unmatched — the same treatment a text
+        match's own non-matching siblings already get below.
+        """
         generation = await self._branches.get_latest_generation(session_id)
         if generation is None:
             return ResolutionResult(
@@ -511,7 +593,42 @@ class HypothesisGenerator:
                 status="unmatched",
                 call_count=0,
             )
+        if self._options is not None:
+            # Whatever's still open (never clicked) is done regardless
+            # of how this generation's leaf-matching turns out below —
+            # an option already `selected` (set at click time, before
+            # this ever runs — see SessionLoop.handle_turn) is left
+            # untouched by this blanket close-out.
+            await self._options.supersede_open_options(generation.id)
+
         leaves = await self._branches.get_open_leaves(generation.id)
+
+        # A branch whose evidence was satisfied this turn by some
+        # OTHER channel than the one resolving this call (e.g. a
+        # CheckEvidence match on a different branch than the one this
+        # resolve is about) is not "unmatched" and must not be
+        # superseded either: it stays open, unpruned. Leaf-prediction
+        # matching / a click and evidence satisfaction are independent
+        # questions about a branch, so this exclusion is additive to
+        # matched_chain, not a replacement for it.
+        evidence_satisfied_ids = {b.id for b in leaves if b.evidence_satisfied}
+
+        if clicked_branch_id is not None:
+            matched_chain = await self._mark_matched_chain(
+                clicked_branch_id, "option_click"
+            )
+            exclude = matched_chain + list(evidence_satisfied_ids - set(matched_chain))
+            await self._branches.supersede_open_branches(generation.id, exclude)
+            return ResolutionResult(
+                session_id=session_id,
+                turn_index=turn_index,
+                matched_branch_id=clicked_branch_id,
+                matched_chain=matched_chain,
+                status="matched",
+                source="option_click",
+                call_count=0,
+            )
+
         if not leaves:
             return ResolutionResult(
                 session_id=session_id,
@@ -525,17 +642,15 @@ class HypothesisGenerator:
         call_count = 1
         matched_id = _parse_resolve_response(raw, {b.id for b in leaves})
 
-        matched_chain: list[UUID] = []
+        matched_chain = []
         if matched_id is not None:
-            await self._branches.set_status(matched_id, BranchStatus.MATCHED)
-            matched_chain.append(matched_id)
-            for ancestor in await self._branches.get_ancestors(matched_id):
-                await self._branches.set_status(ancestor.id, BranchStatus.MATCHED)
-                matched_chain.append(ancestor.id)
+            matched_chain = await self._mark_matched_chain(matched_id, "text_match")
             status = "matched"
-            exclude = matched_chain
+            exclude = matched_chain + list(evidence_satisfied_ids - set(matched_chain))
         else:
             for leaf in leaves:
+                if leaf.id in evidence_satisfied_ids:
+                    continue
                 await self._branches.set_status(leaf.id, BranchStatus.UNMATCHED)
             logger.warning(
                 "hypothesis_generator: no leaf branch from generation %s "
@@ -547,12 +662,14 @@ class HypothesisGenerator:
                 len(leaves),
             )
             status = "unmatched"
-            exclude = [leaf.id for leaf in leaves]
+            exclude = [leaf.id for leaf in leaves if leaf.id not in evidence_satisfied_ids]
+            exclude.extend(evidence_satisfied_ids)
 
         # Close the generation out completely: any branch still `open`
-        # (intermediate depths that were never evaluated as leaves)
-        # becomes `superseded`, so nothing from a resolved generation
-        # lingers as open.
+        # (intermediate depths that were never evaluated as leaves, or
+        # a leaf whose evidence was satisfied this turn) becomes
+        # `superseded`, so nothing from a resolved generation lingers
+        # as open *except* what was deliberately excluded above.
         await self._branches.supersede_open_branches(generation.id, exclude)
 
         return ResolutionResult(
@@ -561,6 +678,7 @@ class HypothesisGenerator:
             matched_branch_id=matched_id,
             matched_chain=matched_chain,
             status=status,
+            source="text_match",
             call_count=call_count,
         )
 
@@ -592,9 +710,15 @@ class BranchResolve:
         self._generator = generator
 
     async def run(
-        self, session_id: UUID, turn_index: int, actual_turn_text: str
+        self,
+        session_id: UUID,
+        turn_index: int,
+        actual_turn_text: str,
+        clicked_branch_id: UUID | None = None,
     ) -> ResolutionResult:
-        return await self._generator.resolve(session_id, turn_index, actual_turn_text)
+        return await self._generator.resolve(
+            session_id, turn_index, actual_turn_text, clicked_branch_id
+        )
 
 
 class SelectBranch:
@@ -637,6 +761,206 @@ class SelectBranch:
                 "highest-plausibility branch"
             ),
         )
+
+
+def _options_prompt(candidates: list[Branch], rejected_reason: str = "") -> str:
+    listing = "\n".join(
+        f'- id={b.id} plausibility={b.plausibility:.2f}: needs evidence that '
+        f'"{b.requires_evidence}" (this bet: "{b.statement}")'
+        for b in candidates
+    )
+    hi = min(4, len(candidates))
+    correction = ""
+    if rejected_reason:
+        correction = (
+            f"\nYour previous attempt was rejected: {rejected_reason}. Every "
+            "option must map to a DIFFERENT branch id from the list below, "
+            "and every branch id used must be one of the ids listed.\n"
+        )
+    return (
+        "GENERATE:OPTIONS\n"
+        "Each of the following branches needs a specific piece of "
+        f"evidence before it is worth exploring further:\n{listing}\n\n"
+        f"Propose between 1 and {hi} clickable options — buttons the "
+        "student can select instead of typing. Each option must map to "
+        "exactly ONE of the branch ids above and must be a claim that, "
+        "if the student affirms it, resolves that branch's stated "
+        "evidence requirement.\n\n"
+        "Hard rules, each with the reason it exists — this is not "
+        "stylistic, violating any of these breaks the mechanism:\n"
+        "- Exactly one branch per option. If an option could satisfy "
+        "two branches, clicking it would not tell you which one was "
+        "true — you would have reintroduced the ambiguity the button "
+        "exists to remove.\n"
+        "- Exactly one claim per option. No bundling two facts into one "
+        "button (e.g. \"I'd check the sign first and then the "
+        "magnitude\" is two claims wearing one button; a student who "
+        "agrees with half of it produces a corrupt signal).\n"
+        "- The option must be answerable about the MATERIAL, not about "
+        "the student's own cognition or preference. A student can "
+        "reliably tell you which step they would take next; they "
+        "cannot reliably tell you how they learn. NEVER generate "
+        "something like \"do you prefer diagrams or equations\" — that "
+        "is the exact failure mode this must avoid.\n"
+        "- The revealing is indirect: write it as a genuine question "
+        "about the subject, in the voice of a tutor continuing the "
+        "lesson, not a survey question about the student. If a student "
+        "could tell they are being profiled by reading it, it is "
+        "written wrong.\n"
+        "- It should read like the natural next thing a good tutor "
+        "would ask — a pause point, not an interruption.\n"
+        f"{correction}"
+        'Respond with JSON: [{"branch_id": "<id>", "text": "..."}, ...]'
+    )
+
+
+def _parse_options_response(
+    raw: str, valid_ids: set[UUID]
+) -> list[OptionProposal] | None:
+    """None means "reject the whole response, regenerate" — a single
+    duplicate or invalid mapping invalidates the batch rather than
+    being silently dropped (see GenerateOptions' docstring: no partial
+    mapping is acceptable, since every option's legibility depends on
+    every OTHER option in the same batch also being clean). An empty
+    list is different from a malformed one: the model explicitly
+    offering no options is a valid, accepted outcome (same
+    "don't force it" discipline as RESOLVE:MATCH's null), not a parse
+    failure that should burn a retry."""
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, list):
+        return None
+    if not parsed:
+        return []
+    seen_branch_ids: set[UUID] = set()
+    proposals: list[OptionProposal] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            return None
+        text = item.get("text")
+        raw_id = item.get("branch_id")
+        if not text or raw_id is None:
+            return None
+        try:
+            branch_id = UUID(str(raw_id))
+        except ValueError:
+            return None
+        if branch_id not in valid_ids or branch_id in seen_branch_ids:
+            return None
+        seen_branch_ids.add(branch_id)
+        proposals.append(OptionProposal(branch_id=branch_id, text=str(text)))
+    return proposals
+
+
+def _check_evidence_prompt(actual_turn_text: str, candidates: list[Branch]) -> str:
+    listing = "\n".join(
+        f"- id={b.id}: {b.requires_evidence}" for b in candidates
+    ) or "(nothing pending)"
+    return (
+        "CHECK:EVIDENCE\n"
+        f"student's actual message: {actual_turn_text}\n\n"
+        f"pending evidence requirements:\n{listing}\n\n"
+        "Does this message clearly establish that one of these "
+        "requirements is now true about the student? Do not force a "
+        "match — a real \"none of these\" is an expected, useful "
+        "outcome, not a failure to avoid.\n"
+        'Respond with JSON: {"satisfied_branch_id": "<id>" or null, '
+        '"confidence": 0.0-1.0}'
+    )
+
+
+def _parse_evidence_check_response(raw: str, valid_ids: set[UUID]) -> UUID | None:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    raw_id = parsed.get("satisfied_branch_id")
+    if raw_id is None:
+        return None
+    try:
+        candidate = UUID(str(raw_id))
+    except ValueError:
+        return None
+    if candidate not in valid_ids:
+        return None
+    return candidate
+
+
+class GenerateOptions:
+    """Turns live branches with an unsatisfied requires_evidence into
+    2-4 clickable options — the second evidence channel, with the
+    interpretation step removed (see this module's callers / the
+    feature's own design notes for the full rationale). Fast tier.
+
+    Skipped entirely (no LLM call) when no branch needs evidence this
+    turn — nothing to ask about. A response with any duplicate or
+    invalid branch mapping is rejected wholesale and regenerated once
+    (_MAX_OPTIONS_ATTEMPTS); if it still fails, this turn simply shows
+    no options rather than a corrupt (ambiguous) mapping — "no options"
+    degrades gracefully, an ambiguous one does not.
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        self.last_call_count: int = 0
+
+    async def run(self, branches: list[Branch]) -> list[OptionProposal]:
+        self.last_call_count = 0
+        candidates = sorted(
+            (b for b in branches if b.requires_evidence and not b.evidence_satisfied),
+            key=lambda b: -b.plausibility,
+        )
+        if not candidates:
+            return []
+        valid_ids = {b.id for b in candidates}
+        rejected_reason = ""
+        for _ in range(_MAX_OPTIONS_ATTEMPTS):
+            raw = await self._llm.complete(_options_prompt(candidates, rejected_reason))
+            self.last_call_count += 1
+            proposals = _parse_options_response(raw, valid_ids)
+            if proposals is not None:
+                return proposals
+            rejected_reason = "duplicate branch id, or a branch id not in the live set"
+        logger.warning(
+            "GenerateOptions: exhausted %d attempt(s) with only invalid "
+            "mappings — showing no options this turn rather than an "
+            "ambiguous one",
+            _MAX_OPTIONS_ATTEMPTS,
+        )
+        return []
+
+
+class CheckEvidence:
+    """The typed-path counterpart to a button click: does the
+    student's typed message establish one of the prior generation's
+    still-pending evidence requirements? Unlike a click this still
+    requires interpretation — the whole reason options exist is to
+    avoid that for the common case — but once judged satisfied, a
+    typed match is treated identically to a click from that point on
+    (same BranchStore.set_evidence_satisfied call). Fast tier, skipped
+    entirely when there is nothing pending to check against.
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        self.last_call_count: int = 0
+
+    async def run(
+        self, actual_turn_text: str, candidates: list[Branch]
+    ) -> EvidenceCheckResult:
+        self.last_call_count = 0
+        if not candidates:
+            return EvidenceCheckResult(satisfied_branch_id=None)
+        raw = await self._llm.complete(
+            _check_evidence_prompt(actual_turn_text, candidates)
+        )
+        self.last_call_count += 1
+        satisfied_id = _parse_evidence_check_response(raw, {b.id for b in candidates})
+        return EvidenceCheckResult(satisfied_branch_id=satisfied_id)
 
 
 class DerivePath:

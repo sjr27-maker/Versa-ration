@@ -91,3 +91,33 @@ async def test_must_not_assume_instruction_is_explicit_when_present():
     prompt = llm.prompts[-1]
     assert "Do NOT assume" in prompt
     assert "the sign of charge Q" in prompt
+
+
+@pytest.mark.asyncio
+async def test_options_lead_in_bans_self_report_and_labeling():
+    """Regression for two exact failures seen live, in order: (1) turn
+    0 ended flatly with no forward motion, (2) turn 1 closed with a
+    self-report question ("how does this feel to you?") -- precisely
+    what options exist to avoid, (3) a follow-up fix attempt then
+    caused Teach to bullet-list the option text verbatim, an even more
+    blatant version of the "restate/list them" failure. The prompt
+    must forbid all three failure modes and push toward paraphrasing
+    the fork in flowing prose instead."""
+    llm = StubLLMClient()
+    teach = Teach(llm)
+
+    await teach.run(
+        _action(),
+        "message",
+        options=["Could we derive this algebraically?", "Could we see it geometrically?"],
+    )
+
+    prompt = llm.prompts[-1]
+    assert "how the student feels" in prompt
+    assert "what they prefer" in prompt
+    assert "kind of learner" in prompt
+    assert "never a list" in prompt.lower()
+    assert "bullet" in prompt.lower()
+    assert "self-report" in prompt
+    assert "do not just stop flatly" in prompt.lower()
+    assert 'call them "options' in prompt.lower()

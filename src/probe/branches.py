@@ -57,8 +57,9 @@ class BranchStore:
                         INSERT INTO branches (
                             id, parent_id, generation_id, session_id, turn_index,
                             depth, depth_label, statement, predicted_next_turn,
-                            plausibility, is_leaf, status, created_at
-                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                            requires_evidence, evidence_satisfied,
+                            plausibility, is_leaf, status, matched_via, created_at
+                        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                         """,
                         b.id,
                         b.parent_id,
@@ -69,9 +70,12 @@ class BranchStore:
                         b.depth_label,
                         b.statement,
                         b.predicted_next_turn,
+                        b.requires_evidence,
+                        b.evidence_satisfied,
                         b.plausibility,
                         b.is_leaf,
                         b.status.value,
+                        b.matched_via,
                         b.created_at,
                     )
         return branches
@@ -133,6 +137,59 @@ class BranchStore:
         if updated is None:
             raise KeyError(f"branch {branch_id} not found")
         return await self._require(branch_id)
+
+    async def set_matched(self, branch_id: UUID, matched_via: str) -> Branch:
+        """Marks a branch matched AND records which channel resolved
+        it, in one UPDATE — the only place status transitions to
+        `matched`. `matched_via` ("option_click" | "text_match") is
+        what lets aggregate queries below report click-driven and
+        text-match-driven confirmations as two separate numbers
+        instead of one blended one (see Branch.matched_via)."""
+        async with self._pool.acquire() as conn:
+            updated = await conn.fetchval(
+                "UPDATE branches SET status = 'matched', matched_via = $2 "
+                "WHERE id = $1 RETURNING id",
+                branch_id,
+                matched_via,
+            )
+        if updated is None:
+            raise KeyError(f"branch {branch_id} not found")
+        return await self._require(branch_id)
+
+    async def set_evidence_satisfied(
+        self, branch_id: UUID, satisfied: bool = True
+    ) -> Branch:
+        """Flips a branch's evidence_satisfied flag — the one event
+        that unblocks should_expand_branch's fourth gate. Set by a
+        direct option click (no LLM call, unambiguous) or by
+        CheckEvidence judging a typed message to establish it; both
+        paths call this same method so the branch ends up in an
+        identical state either way."""
+        async with self._pool.acquire() as conn:
+            updated = await conn.fetchval(
+                "UPDATE branches SET evidence_satisfied = $2 WHERE id = $1 RETURNING id",
+                branch_id,
+                satisfied,
+            )
+        if updated is None:
+            raise KeyError(f"branch {branch_id} not found")
+        return await self._require(branch_id)
+
+    async def list_awaiting_evidence(self, generation_id: UUID) -> list[Branch]:
+        """Open branches in one generation whose requires_evidence is
+        still unsatisfied — the candidate pool for both GenerateOptions
+        and CheckEvidence."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM branches
+                WHERE generation_id = $1 AND status = 'open'
+                    AND requires_evidence IS NOT NULL AND evidence_satisfied = FALSE
+                ORDER BY plausibility DESC
+                """,
+                generation_id,
+            )
+        return [self._row_to_branch(row) for row in rows]
 
     async def supersede_open_branches(
         self, generation_id: UUID, exclude_ids: list[UUID] | None = None
@@ -219,16 +276,32 @@ class BranchStore:
         """Leaf-branch match rate per session, chronological — "does it
         actually predict me" over time. Only status in
         (matched, unmatched) counts as resolved; a session's most
-        recent, still-open generation is excluded until it resolves."""
+        recent, still-open generation is excluded until it resolves.
+
+        text_match and option_click are scored separately: a click
+        confirms the student chose an offered option, not that the
+        system predicted them, so click-resolved matches are excluded
+        from total_resolved/matched_count entirely and reported only
+        via the standalone option_click_count — never blended into
+        the match-rate ratio (see BranchMatchRatePoint's docstring).
+        """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT
                     s.id AS session_id,
                     s.created_at AS session_created_at,
-                    count(*) FILTER (WHERE b.status IN ('matched', 'unmatched'))
-                        AS total_resolved,
-                    count(*) FILTER (WHERE b.status = 'matched') AS matched_count
+                    count(*) FILTER (
+                        WHERE b.status IN ('matched', 'unmatched')
+                            AND (b.matched_via IS NULL OR b.matched_via = 'text_match')
+                    ) AS total_resolved,
+                    count(*) FILTER (
+                        WHERE b.status = 'matched'
+                            AND (b.matched_via IS NULL OR b.matched_via = 'text_match')
+                    ) AS matched_count,
+                    count(*) FILTER (
+                        WHERE b.status = 'matched' AND b.matched_via = 'option_click'
+                    ) AS option_click_count
                 FROM branches b
                 JOIN sessions s ON s.id = b.session_id
                 WHERE s.learner_id = $1 AND b.is_leaf = TRUE
@@ -243,6 +316,7 @@ class BranchStore:
                 session_created_at=row["session_created_at"],
                 total_resolved=row["total_resolved"],
                 matched_count=row["matched_count"],
+                option_click_count=row["option_click_count"],
             )
             for row in rows
         ]
@@ -253,16 +327,28 @@ class BranchStore:
         """Depth-0 (intent) statements grouped by exact text across all
         of a learner's sessions, most-recurring first — which bets
         about this learner keep coming up, and how often they're
-        actually confirmed. `matched` propagates up from a leaf to its
-        full ancestor chain (see resolve()), so a root's own status
-        already reflects whether any descendant of it matched."""
+        actually confirmed. `matched` (and `matched_via`) propagate up
+        from a leaf to its full ancestor chain (see resolve()), so a
+        root's own status/matched_via already reflect whether and how
+        any descendant of it matched.
+
+        `matched_count` counts text_match confirmations only;
+        `matched_via_click_count` is the same click-vs-text split as
+        match_rate_by_session_for_learner, kept as its own number —
+        never combine the two."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT
                     b.statement,
                     count(*) AS total_count,
-                    count(*) FILTER (WHERE b.status = 'matched') AS matched_count
+                    count(*) FILTER (
+                        WHERE b.status = 'matched'
+                            AND (b.matched_via IS NULL OR b.matched_via = 'text_match')
+                    ) AS matched_count,
+                    count(*) FILTER (
+                        WHERE b.status = 'matched' AND b.matched_via = 'option_click'
+                    ) AS matched_via_click_count
                 FROM branches b
                 JOIN sessions s ON s.id = b.session_id
                 WHERE s.learner_id = $1 AND b.parent_id IS NULL
@@ -278,6 +364,7 @@ class BranchStore:
                 statement=row["statement"],
                 total_count=row["total_count"],
                 matched_count=row["matched_count"],
+                matched_via_click_count=row["matched_via_click_count"],
             )
             for row in rows
         ]
@@ -299,8 +386,11 @@ class BranchStore:
             depth_label=row["depth_label"],
             statement=row["statement"],
             predicted_next_turn=row["predicted_next_turn"],
+            requires_evidence=row["requires_evidence"],
+            evidence_satisfied=row["evidence_satisfied"],
             plausibility=row["plausibility"],
             is_leaf=row["is_leaf"],
             status=BranchStatus(row["status"]),
+            matched_via=row["matched_via"],
             created_at=row["created_at"],
         )

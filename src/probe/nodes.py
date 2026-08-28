@@ -455,6 +455,7 @@ class Teach:
         action: CandidateAction,
         student_message: str,
         path_requirement: PathRequirement | None = None,
+        options: list[str] | None = None,
     ) -> str:
         """Teach no longer receives the branch tree or a bare topic
         string — a tree invites free association, a path constrains.
@@ -463,7 +464,14 @@ class Teach:
         turn's teaching instead; None only when branch generation is
         disabled or failed upstream, in which case this degrades to
         target_concept-only framing, the same as before this feature
-        existed."""
+        existed.
+
+        `options` (GenerateOptions' output, just the button text — not
+        which branch each maps to; Teach only needs to know what to
+        lead into, not the underlying bookkeeping) are rendered as
+        buttons by the UI below this response, not restated in it. The
+        instruction below is about how the response *ends*, not what
+        it contains."""
         self.last_call_count = 0
         focus = (
             f"Focus specifically on the concept {action.target_concept!r}."
@@ -488,6 +496,32 @@ class Teach:
                     "address that dependency explicitly rather than "
                     "picking a value.\n"
                 )
+        options_block = ""
+        if options:
+            option_listing = "\n".join(f"- {o}" for o in options)
+            options_block = (
+                "\nThe following will appear as clickable buttons right "
+                "after your response — they are the real fork this "
+                f"conversation is about to take:\n{option_listing}\n"
+                "End your response AT that fork, in ONE flowing sentence "
+                "or two of ordinary prose — never a list, never bullet "
+                "points, never numbered items, and never wording close "
+                "enough to either button that it reads as copied. "
+                "Paraphrase the underlying difference between the "
+                "directions (what each would actually show about the "
+                "problem) folded into your own closing sentence, the "
+                "same way the rest of your response reads — so the "
+                "buttons feel like the obvious next step, not a menu "
+                "bolted onto the end. Do not just stop flatly with no "
+                "forward motion either, and never call them \"options\" "
+                "or say \"choose one.\"\n"
+                "Never end by asking how the student feels, what they "
+                "prefer, or what kind of learner they are — a question "
+                "about the student's own reaction or self-knowledge is "
+                "exactly the self-report framing this mechanism exists "
+                "to avoid. The close is about what happens next in the "
+                "material, not about the student.\n"
+            )
         prompt = (
             "TEACH: "
             + json.dumps(
@@ -500,6 +534,7 @@ class Teach:
             )
             + (f"\n{focus}" if focus else "")
             + path_block
+            + options_block
             + "\nDo not introduce specific values, signs, conditions, or "
             "givens that appear in neither the student's message nor "
             "what you were told above.\n"

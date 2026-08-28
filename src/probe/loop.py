@@ -1,6 +1,7 @@
-"""The session loop: [BranchResolve] → [AttachTopic] → Diagnose →
-Infer → Update → Replan → Plan → [BranchGenerate → SelectBranch →
-DerivePath] → Teach → wait → repeat.
+"""The session loop: [evidence satisfaction] → [BranchResolve] →
+[AttachTopic] → Diagnose → Infer → Update → Replan → Plan →
+[BranchGenerate → GenerateOptions → SelectBranch → DerivePath] →
+Teach → wait → repeat.
 
 Diagnose runs first each turn, checking the student's response against
 what was expected from the *previous* turn's Teach output
@@ -55,6 +56,24 @@ happens before Teach runs, it happens regardless of whether Teach
 subsequently fails — see the teach_failed handling below for what that
 implies for next turn's resolve().
 
+Some branches carry `requires_evidence` — a claim with an entry
+condition, not just a forecast (see should_expand_branch's fourth
+gate): they hold at their current depth until evidence_satisfied
+flips true. `GenerateOptions` turns live evidence-needing branches
+into 2-4 clickable options, an unambiguous evidence channel with the
+interpretation step removed. At the top of handle_turn, before
+BranchResolve, a click (`selected_option_id`) satisfies its branch
+directly with no LLM call; typed text instead gets one `CheckEvidence`
+check against the prior generation's still-pending requirements — the
+one place this mechanism still accepts interpretation, since a typed
+answer isn't a button. Either path calls the same
+`BranchStore.set_evidence_satisfied`, so a branch ends up in an
+identical state regardless of which channel satisfied it. If neither a
+click nor typed text satisfies anything that was on offer,
+`options_missed` is set — read as "the options were wrong," not "the
+student was uncooperative" — and fed into the next turn's generation
+context.
+
 Topic inference (`AttachTopic`, nodes.py) replaces `--topic`: a
 session may be created with `concept_graph_id=None` (migration 013),
 and its first turn (`turn_index == 0`) runs `AttachTopic` against the
@@ -101,14 +120,23 @@ from probe.grounding import GroundConcept
 from probe.hypothesis_generator import (
     BranchGenerate,
     BranchResolve,
+    CheckEvidence,
     DerivePath,
+    GenerateOptions,
     HypothesisGenerator,
     SelectBranch,
     build_branch_path,
 )
 from probe.llm import LLMClient, ModelTierClients
 from probe.mismatch import MismatchDetector
-from probe.models import CandidateAction, PlanOutput, TeachingAction, TurnDiagnostics
+from probe.models import (
+    CandidateAction,
+    Option,
+    OptionStatus,
+    PlanOutput,
+    TeachingAction,
+    TurnDiagnostics,
+)
 from probe.nodes import (
     DEFAULT_GENERATION_WIDTH,
     MAX_CALLS_PER_TURN,
@@ -122,6 +150,7 @@ from probe.nodes import (
     Test,
     Update,
 )
+from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
 from probe.reasoning_budget import (
     BranchBudgetConfig,
@@ -208,6 +237,7 @@ class SessionLoop:
         branch_store: BranchStore | None = None,
         branch_budget_config: BranchBudgetConfig | None = None,
         diagnostics_store: TurnDiagnosticsStore | None = None,
+        option_store: OptionStore | None = None,
         on_node_start: Callable[[str], None] | None = None,
     ) -> None:
         # Tiering (fast/capable/best -> real Gemini models, see
@@ -262,6 +292,11 @@ class SessionLoop:
         self._exploration_target = None
         self._last_teach_message: str = ""
         self._consecutive_ungrounded_turns: int = 0
+        # Whether the immediately preceding turn presented options the
+        # student typed past without satisfying — read by
+        # _build_transcript_context to inform this turn's generation
+        # (see handle_turn's options_missed handling).
+        self._last_options_missed: bool = False
 
         # HypothesisGenerator is opt-in: branch_store=None (the default,
         # and what every existing test still passes) reproduces the
@@ -269,10 +304,11 @@ class SessionLoop:
         # never called. Tier: fast, same reasoning as GroundConcept/
         # MismatchDetector (fires every turn, multiplies fast).
         self._branch_store = branch_store
+        self._options_store = option_store
         self._prior_generation_id = None
         if branch_store is not None:
             self._hypothesis_generator = HypothesisGenerator(
-                tiers.fast, branch_store, branch_budget_config
+                tiers.fast, branch_store, branch_budget_config, option_store
             )
             self.branch_generate: BranchGenerate | None = BranchGenerate(
                 self._hypothesis_generator
@@ -287,6 +323,19 @@ class SessionLoop:
             self.branch_resolve = None
             self.select_branch = None
             self.derive_path = None
+
+        # GenerateOptions/CheckEvidence are a further opt-in on top of
+        # branch_store: they need real branches to reason over, so
+        # option_store without branch_store does nothing. option_store
+        # alone (branch_store also set) is what "both channels stay
+        # enabled" means — the click path and the typed-evidence-check
+        # path both route through this pair.
+        if branch_store is not None and option_store is not None:
+            self.generate_options: GenerateOptions | None = GenerateOptions(tiers.fast)
+            self.check_evidence: CheckEvidence | None = CheckEvidence(tiers.fast)
+        else:
+            self.generate_options = None
+            self.check_evidence = None
 
     async def run_interactive(
         self, learner_id: UUID, concept_graph_id: UUID | None
@@ -313,12 +362,82 @@ class SessionLoop:
         return session_id
 
     async def handle_turn(
-        self, session_id: UUID, turn_index: int, turn_text: str
+        self,
+        session_id: UUID,
+        turn_index: int,
+        turn_text: str,
+        selected_option_id: UUID | None = None,
     ) -> str:
         start = time.monotonic()
         retry_count_start = _total_retry_count(self._tiers)
         warnings: list[str] = []
         node_call_counts: dict[str, int] = {}
+
+        # Evidence satisfaction: a click is unambiguous and needs no
+        # LLM call at all; typed text gets one check against the prior
+        # generation's still-pending requires_evidence. Both happen
+        # before BranchResolve so its own option-supersession (inside
+        # resolve()) sees the outcome — an option marked `selected`
+        # here is left untouched by that blanket close-out, exactly
+        # the way a matched branch's ancestor chain is excluded from
+        # supersede_open_branches.
+        had_pending_options = False
+        satisfied_branch_id: UUID | None = None
+        # Set only by an actual click — distinct from satisfied_branch_id
+        # (which a typed CheckEvidence match also sets) because
+        # BranchResolve needs to know specifically whether *this* turn
+        # was a click, not merely whether something got satisfied.
+        clicked_branch_id: UUID | None = None
+        prior_generation_id = self._prior_generation_id
+        if prior_generation_id is not None and self._options_store is not None:
+            pending_options = await self._options_store.list_by_generation(
+                prior_generation_id
+            )
+            had_pending_options = any(
+                o.status is OptionStatus.OPEN for o in pending_options
+            )
+
+        if selected_option_id is not None and self._options_store is not None:
+            option = await self._options_store.get(selected_option_id)
+            if option is not None:
+                await self._options_store.set_status(option.id, OptionStatus.SELECTED)
+                await self._branch_store.set_evidence_satisfied(option.branch_id, True)
+                satisfied_branch_id = option.branch_id
+                clicked_branch_id = option.branch_id
+        elif (
+            selected_option_id is None
+            and self.check_evidence is not None
+            and prior_generation_id is not None
+        ):
+            evidence_candidates = await self._branch_store.list_awaiting_evidence(
+                prior_generation_id
+            )
+            if evidence_candidates:
+                result = await self._call_node_or_warn(
+                    self.check_evidence,
+                    session_id,
+                    turn_index,
+                    "CheckEvidence",
+                    None,
+                    warnings,
+                    actual_turn_text=turn_text,
+                    candidates=evidence_candidates,
+                )
+                node_call_counts["CheckEvidence"] = self.check_evidence.last_call_count
+                if result is not None and result.satisfied_branch_id is not None:
+                    satisfied_branch_id = result.satisfied_branch_id
+                    await self._branch_store.set_evidence_satisfied(
+                        result.satisfied_branch_id, True
+                    )
+
+        # Read this as "the options didn't offer what the student
+        # actually needed," not as the student being uncooperative —
+        # it's a signal about the branch/option set, not the student.
+        options_missed = (
+            had_pending_options
+            and selected_option_id is None
+            and satisfied_branch_id is None
+        )
 
         resolution_call_count = 0
         if self.branch_resolve is not None and self._prior_generation_id is not None:
@@ -332,6 +451,7 @@ class SessionLoop:
                 session_id=session_id,
                 turn_index=turn_index,
                 actual_turn_text=turn_text,
+                clicked_branch_id=clicked_branch_id,
             )
             if resolution is not None:
                 resolution_call_count = resolution.call_count
@@ -522,8 +642,11 @@ class SessionLoop:
         # to gate on.
         generation_call_count = 0
         path_requirement = None
+        option_texts: list[str] = []
         if self.branch_generate is not None:
-            transcript_context = await self._build_transcript_context(session_id)
+            transcript_context = await self._build_transcript_context(
+                session_id, self._last_options_missed
+            )
             generation = await self._call_node_or_warn(
                 self.branch_generate,
                 session_id,
@@ -543,6 +666,33 @@ class SessionLoop:
                 self._prior_generation_id = generation.generation.id
                 for note in generation.redundancy_notes:
                     warnings.append(f"redundancy_check: {note}")
+
+                if generation.branches and self.generate_options is not None:
+                    proposals = await self._call_node_or_warn(
+                        self.generate_options,
+                        session_id,
+                        turn_index,
+                        "GenerateOptions",
+                        [],
+                        warnings,
+                        branches=generation.branches,
+                    )
+                    node_call_counts["GenerateOptions"] = (
+                        self.generate_options.last_call_count
+                    )
+                    if proposals:
+                        new_options = [
+                            Option(
+                                branch_id=p.branch_id,
+                                generation_id=generation.generation.id,
+                                session_id=session_id,
+                                turn_index=turn_index,
+                                text=p.text,
+                            )
+                            for p in proposals
+                        ]
+                        await self._options_store.create_options(new_options)
+                        option_texts = [o.text for o in new_options]
 
                 if generation.branches and self.select_branch is not None:
                     selection = await self._call_node_or_warn(
@@ -611,6 +761,7 @@ class SessionLoop:
                 action=plan_output.winner,
                 student_message=turn_text,
                 path_requirement=path_requirement,
+                options=option_texts,
             )
             node_call_counts["Teach"] = self.teach.last_call_count
         except Exception as exc:
@@ -639,8 +790,8 @@ class SessionLoop:
         # Infer, Plan's proposer, and Teach each track their own calls;
         # ValueFunction's four LLM-calling terms are on each candidate's
         # ActionScore; BranchResolve/BranchGenerate's call_count is on
-        # their own return values; SelectBranch/DerivePath are each a
-        # single tracked call).
+        # their own return values; SelectBranch/DerivePath/
+        # GenerateOptions/CheckEvidence are each a single tracked call).
         total_call_count = (
             diagnose_result["llm_call_count"]
             + self.infer.last_call_count
@@ -651,6 +802,8 @@ class SessionLoop:
             + generation_call_count
             + node_call_counts.get("SelectBranch", 0)
             + node_call_counts.get("DerivePath", 0)
+            + node_call_counts.get("GenerateOptions", 0)
+            + node_call_counts.get("CheckEvidence", 0)
             + node_call_counts.get("AttachTopic", 0)
         )
         guardrail_fired = total_call_count > MAX_CALLS_PER_TURN
@@ -670,6 +823,14 @@ class SessionLoop:
                 f"(limit {MAX_CALLS_PER_TURN})"
             )
 
+        if options_missed:
+            warnings.append(
+                "options_missed: the student typed past the prior turn's "
+                "options without satisfying any of them — treat this as a "
+                "signal the branch/option set was wrong, not that the "
+                "student was uncooperative"
+            )
+
         if self._diagnostics is not None:
             await self._diagnostics.record(
                 TurnDiagnostics(
@@ -685,10 +846,12 @@ class SessionLoop:
                     inferred_topic=inferred_topic,
                     topic_seeded_new=topic_seeded_new,
                     retry_count=_total_retry_count(self._tiers) - retry_count_start,
+                    options_missed=options_missed,
                 )
             )
 
         self._last_teach_message = message
+        self._last_options_missed = options_missed
         return message
 
     async def _build_concept_state(
@@ -737,7 +900,9 @@ class SessionLoop:
             },
         }
 
-    async def _build_transcript_context(self, session_id: UUID) -> str:
+    async def _build_transcript_context(
+        self, session_id: UUID, options_missed_last_turn: bool = False
+    ) -> str:
         """Full session history for HypothesisGenerator.generate() —
         every student turn recorded so far, including this turn's own
         (record_turn already wrote it earlier in handle_turn). No
@@ -745,9 +910,22 @@ class SessionLoop:
         *before* Teach, so there is nothing yet to append — the tree
         conditions on Plan's decided action/target_concept instead (see
         handle_turn), which is available at this point in the turn and
-        Teach's rendered text is not."""
+        Teach's rendered text is not.
+
+        `options_missed_last_turn` feeds the prior turn's options_missed
+        outcome back into this turn's generation prompt: if the student
+        went around what was offered, the regenerated tree should be
+        able to react to having missed, not repeat the same shape of
+        options blind to the fact that they didn't land."""
         turns = await self._transcript.list_turns(session_id)
         lines = [f"student (turn {t.turn_index}): {t.text}" for t in turns]
+        if options_missed_last_turn:
+            lines.append(
+                "[note: the options offered last turn did not match what "
+                "the student actually needed -- they answered around them "
+                "instead of clicking one. Consider whether the current "
+                "branch set is asking the right question.]"
+            )
         return "\n".join(lines)
 
     async def _call_node_or_warn(

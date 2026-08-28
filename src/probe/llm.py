@@ -150,6 +150,13 @@ _DEFAULT_RESPONSES: dict[str, str] = {
     # stub-fabricated id — same convention as RESOLVE:MATCH.
     "SELECT:BRANCH": json.dumps({"selected_branch_id": None, "rationale": ""}),
     "DERIVE:PATH": _DEFAULT_PATH_REQUIREMENT,
+    # Conservative default: no options, so a test that doesn't opt in
+    # doesn't need to fabricate real branch ids for GenerateOptions to
+    # map against — an empty list is a valid outcome, not rejected.
+    "GENERATE:OPTIONS": "[]",
+    # Conservative default: nothing satisfied, so CheckEvidence doesn't
+    # fabricate a match — same convention as RESOLVE:MATCH/SELECT:BRANCH.
+    "CHECK:EVIDENCE": json.dumps({"satisfied_branch_id": None, "confidence": 0.0}),
     # AttachTopic's topic-extraction call.
     "TOPIC:INFER": json.dumps({"topic": "stub topic"}),
 }
@@ -317,6 +324,7 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
                 "statement": {"type": "STRING"},
                 "plausibility": {"type": "NUMBER"},
                 "predicted_next_turn": {"type": "STRING"},
+                "requires_evidence": {"type": "STRING", "nullable": True},
             },
             "required": ["statement", "plausibility", "predicted_next_turn"],
         },
@@ -333,6 +341,7 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
                         "statement": {"type": "STRING"},
                         "plausibility": {"type": "NUMBER"},
                         "predicted_next_turn": {"type": "STRING"},
+                        "requires_evidence": {"type": "STRING", "nullable": True},
                     },
                     "required": ["statement", "plausibility", "predicted_next_turn"],
                 },
@@ -365,6 +374,25 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
             "scope": {"type": "STRING"},
         },
         "required": ["current_belief", "needed", "must_not_assume", "scope"],
+    },
+    "GENERATE:OPTIONS": {
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "branch_id": {"type": "STRING"},
+                "text": {"type": "STRING"},
+            },
+            "required": ["branch_id", "text"],
+        },
+    },
+    "CHECK:EVIDENCE": {
+        "type": "OBJECT",
+        "properties": {
+            "satisfied_branch_id": {"type": "STRING", "nullable": True},
+            "confidence": {"type": "NUMBER"},
+        },
+        "required": ["confidence"],
     },
     "TOPIC:INFER": {
         "type": "OBJECT",

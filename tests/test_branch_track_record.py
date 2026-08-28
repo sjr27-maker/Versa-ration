@@ -145,6 +145,79 @@ async def test_recurring_root_statements_excludes_non_root_branches(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_match_rate_excludes_option_click_matches_from_the_rate(
+    branch_store, transcript, learner_store, concept_graph_id
+):
+    """A click confirms the student picked an offered option, not
+    that the system predicted them — it must not inflate matched_count
+    or total_resolved, and must be reported only via the separate
+    option_click_count."""
+    learner = await learner_store.create(label="track-record-click-split")
+    session_id = await transcript.create_session(learner.id, concept_graph_id)
+
+    text_matched = Branch(
+        session_id=session_id, turn_index=0, depth=0, depth_label="intent",
+        statement="a", predicted_next_turn="pa", plausibility=0.5, is_leaf=True,
+        status=BranchStatus.MATCHED, matched_via="text_match", generation_id=uuid4(),
+    )
+    click_matched = Branch(
+        session_id=session_id, turn_index=0, depth=0, depth_label="intent",
+        statement="b", predicted_next_turn="pb", plausibility=0.5, is_leaf=True,
+        status=BranchStatus.MATCHED, matched_via="option_click", generation_id=uuid4(),
+    )
+    unmatched = Branch(
+        session_id=session_id, turn_index=0, depth=0, depth_label="intent",
+        statement="c", predicted_next_turn="pc", plausibility=0.5, is_leaf=True,
+        status=BranchStatus.UNMATCHED, generation_id=uuid4(),
+    )
+    await _make_generation(
+        branch_store, session_id, 0, [text_matched, click_matched, unmatched]
+    )
+
+    points = await branch_store.match_rate_by_session_for_learner(learner.id)
+
+    assert len(points) == 1
+    point = points[0]
+    # Denominator/numerator are text_match-only: click_matched excluded
+    # from both, not just the numerator.
+    assert point.total_resolved == 2
+    assert point.matched_count == 1
+    assert point.match_rate == pytest.approx(0.5)
+    assert point.option_click_count == 1
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_recurring_root_statements_reports_click_confirmations_separately(
+    branch_store, transcript, learner_store, concept_graph_id
+):
+    learner = await learner_store.create(label="track-record-recurring-click")
+    session_a = await transcript.create_session(learner.id, concept_graph_id)
+    session_b = await transcript.create_session(learner.id, concept_graph_id)
+
+    text_confirmed = Branch(
+        session_id=session_a, turn_index=0, depth=0, depth_label="intent",
+        statement="wants an analogy", predicted_next_turn="p", plausibility=0.5,
+        is_leaf=True, status=BranchStatus.MATCHED, matched_via="text_match",
+        generation_id=uuid4(),
+    )
+    click_confirmed = Branch(
+        session_id=session_b, turn_index=0, depth=0, depth_label="intent",
+        statement="wants an analogy", predicted_next_turn="p", plausibility=0.5,
+        is_leaf=True, status=BranchStatus.MATCHED, matched_via="option_click",
+        generation_id=uuid4(),
+    )
+    await _make_generation(branch_store, session_a, 0, [text_confirmed])
+    await _make_generation(branch_store, session_b, 0, [click_confirmed])
+
+    recurring = await branch_store.recurring_root_statements_for_learner(learner.id)
+
+    row = next(r for r in recurring if r.statement == "wants an analogy")
+    assert row.total_count == 2
+    assert row.matched_count == 1  # text_match only
+    assert row.matched_via_click_count == 1  # tracked separately, never summed in
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_track_record_methods_do_not_cross_contaminate_between_learners(
     branch_store, transcript, learner_store, concept_graph_id
 ):

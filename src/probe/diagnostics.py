@@ -32,8 +32,8 @@ class TurnDiagnosticsStore:
                     id, session_id, turn_index, node_call_counts,
                     total_call_count, guardrail_fired, entropy_bits,
                     duration_ms, warnings, teach_failed, inferred_topic,
-                    topic_seeded_new, retry_count, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    topic_seeded_new, retry_count, options_missed, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 """,
                 diagnostics.id,
                 diagnostics.session_id,
@@ -48,6 +48,7 @@ class TurnDiagnosticsStore:
                 diagnostics.inferred_topic,
                 diagnostics.topic_seeded_new,
                 diagnostics.retry_count,
+                diagnostics.options_missed,
                 diagnostics.created_at,
             )
         return diagnostics
@@ -86,5 +87,6 @@ class TurnDiagnosticsStore:
             inferred_topic=row["inferred_topic"],
             topic_seeded_new=row["topic_seeded_new"],
             retry_count=row["retry_count"],
+            options_missed=row["options_missed"],
             created_at=row["created_at"],
         )

@@ -40,6 +40,7 @@ from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
 from probe.learner import LearnerStore
 from probe.llm import ModelTierClients, StubLLMClient, build_tier_clients
+from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
 from probe.revision import WorldModelRevisionStore
 from probe.store import HypothesisStore
@@ -109,6 +110,7 @@ class Stores:
         self.learner_overlay = LearnerOverlay(pool)
         self.revisions = WorldModelRevisionStore(pool)
         self.branches = BranchStore(pool)
+        self.options = OptionStore(pool)
         self.diagnostics = TurnDiagnosticsStore(pool)
         self.learners = LearnerStore(pool)
 

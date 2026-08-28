@@ -127,15 +127,22 @@ for revision in report.pending_revisions:
             st.rerun()
 
 st.subheader('Branch track record — "does it actually predict me"')
+st.caption(
+    "A click confirms the student picked an option the system offered — "
+    "it is not evidence the system predicted them. Kept as a separate "
+    "number below, never folded into match_rate."
+)
 points = run_async(stores.branches.match_rate_by_session_for_learner(learner.id))
 if points:
-    st.line_chart({"match_rate": [p.match_rate for p in points]})
+    st.line_chart({"match_rate (text match only)": [p.match_rate for p in points]})
     total_resolved = sum(p.total_resolved for p in points)
     total_matched = sum(p.matched_count for p in points)
+    total_clicked = sum(p.option_click_count for p in points)
     st.caption(
-        f"{total_matched} / {total_resolved} leaf predictions matched, "
-        "across all sessions"
+        f"{total_matched} / {total_resolved} leaf predictions matched via "
+        f"text (prediction accuracy), across all sessions"
     )
+    st.caption(f"{total_clicked} leaves resolved via an option click, separately")
 else:
     st.write("No resolved branch predictions yet.")
 
@@ -144,7 +151,9 @@ if recurring:
     st.markdown("**Most-recurring intents**")
     st.caption(
         "Grouped by exact statement text — a differently-worded but "
-        "semantically identical intent is counted separately."
+        "semantically identical intent is counted separately. "
+        "\"matched\" and \"match_rate\" are text-match predictions only; "
+        "\"clicked\" is tracked separately and never combined into them."
     )
     st.dataframe(
         [
@@ -153,6 +162,7 @@ if recurring:
                 "seen": r.total_count,
                 "matched": r.matched_count,
                 "match_rate": round(r.match_rate, 2),
+                "clicked": r.matched_via_click_count,
             }
             for r in recurring
         ],

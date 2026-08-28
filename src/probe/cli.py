@@ -19,6 +19,7 @@ from probe.learner import LearnerStore
 from probe.llm import LLMClient, ModelTierClients, StubLLMClient, build_tier_clients
 from probe.loop import SessionLoop
 from probe.models import ConceptGraphMeta, Learner
+from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
 from probe.portrait import LearnerPortrait, build_portrait
 from probe.revision import RevisionApplicationError, WorldModelRevisionStore
@@ -178,6 +179,7 @@ async def _chat(learner_spec: str, topic_spec: str, use_stub: bool) -> None:
             llm=tiers.fast,
             model_tier_clients=tiers,
             branch_store=BranchStore(pool),
+            option_store=OptionStore(pool),
             diagnostics_store=TurnDiagnosticsStore(pool),
         )
         await loop.run_interactive(learner.id, graph_meta.id)

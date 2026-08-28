@@ -10,6 +10,7 @@ from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
 from probe.learner import LearnerStore
+from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
 from probe.revision import WorldModelRevisionStore
 from probe.store import HypothesisStore
@@ -40,6 +41,7 @@ async def pool():
         await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
         await conn.execute("DROP TABLE IF EXISTS turn_diagnostics CASCADE")
         await conn.execute("DROP TABLE IF EXISTS hypothesis_tier_changes CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS options CASCADE")
         await conn.execute("DROP TABLE IF EXISTS branches CASCADE")
         await conn.execute("DROP TABLE IF EXISTS branch_generations CASCADE")
         await conn.execute("DROP TABLE IF EXISTS world_model_revision_evidence CASCADE")
@@ -54,6 +56,7 @@ async def pool():
         await conn.execute("DROP TABLE IF EXISTS concept_prerequisites CASCADE")
         await conn.execute("DROP TABLE IF EXISTS concept_nodes CASCADE")
         await conn.execute("DROP TABLE IF EXISTS concept_graphs CASCADE")
+        await conn.execute("DROP TYPE IF EXISTS option_status")
         await conn.execute("DROP TYPE IF EXISTS branch_status")
         await conn.execute("DROP TYPE IF EXISTS revision_status")
         await conn.execute("DROP TYPE IF EXISTS overlay_state")
@@ -115,6 +118,11 @@ async def revision_store(clean_pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def branch_store(clean_pool):
     return BranchStore(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def option_store(clean_pool):
+    return OptionStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")
