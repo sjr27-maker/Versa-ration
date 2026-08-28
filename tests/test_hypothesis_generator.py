@@ -5,11 +5,20 @@ import pytest
 
 from probe.hypothesis_generator import HypothesisGenerator
 from probe.llm import StubLLMClient
-from probe.models import BranchStatus
+from probe.models import BranchStatus, CandidateAction, TeachingAction
 from probe.reasoning_budget import BranchBudgetConfig
 
 STRONG_STATEMENT = "strong bet: the student wants to connect this to something familiar"
 WEAK_STATEMENT = "weak bet: something vague and unlikely"
+
+# Plan's decided action for that turn — generate() now conditions its
+# root-wave prompt on this, not on Teach's rendered text (which no
+# longer exists yet at the point generate() runs). Any fixed candidate
+# works for these tests since none of them assert on the prompt's
+# content.
+_PLANNED_ACTION = CandidateAction(
+    action=TeachingAction.EXPLAIN, target_concept=None, rationale="test"
+)
 
 _INTENT_RESPONSE = json.dumps(
     [
@@ -55,7 +64,7 @@ async def test_generate_produces_a_valid_tree_with_correct_parent_chains(
         llm, branch_store, BranchBudgetConfig(max_depth=3, max_total_branches=20)
     )
 
-    result = await gen.generate(session_id, 0, store, "student context so far", learner_id)
+    result = await gen.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
 
     assert result.generation.root_count == 2
     by_id = {b.id: b for b in result.branches}
@@ -77,7 +86,7 @@ async def test_strong_branch_expands_deeper_than_weak_branch_same_generation(
         llm, branch_store, BranchBudgetConfig(max_depth=3, max_total_branches=20)
     )
 
-    result = await gen.generate(session_id, 0, store, "student context so far", learner_id)
+    result = await gen.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
 
     strong_root = next(b for b in result.branches if b.statement == STRONG_STATEMENT)
     weak_root = next(b for b in result.branches if b.statement == WEAK_STATEMENT)
@@ -103,7 +112,7 @@ async def test_every_leaf_carries_a_concretely_checkable_prediction(
         llm, branch_store, BranchBudgetConfig(max_depth=3, max_total_branches=20)
     )
 
-    result = await gen.generate(session_id, 0, store, "student context so far", learner_id)
+    result = await gen.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
 
     leaves = [b for b in result.branches if b.is_leaf]
     assert leaves, "expected at least one leaf branch"
@@ -124,7 +133,7 @@ async def test_branches_clearing_redundancy_check_are_logged_with_siblings(
     )
 
     with caplog.at_level(logging.INFO, logger="probe.hypothesis_generator"):
-        await gen.generate(session_id, 0, store, "student context so far", learner_id)
+        await gen.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
 
     info_records = [
         r for r in caplog.records if "cleared the redundancy check" in r.message
@@ -143,7 +152,7 @@ async def test_resolve_matches_a_leaf_and_propagates_matched_status_up_the_chain
     generator = HypothesisGenerator(
         gen_llm, branch_store, BranchBudgetConfig(max_depth=2, max_total_branches=20)
     )
-    generation = await generator.generate(session_id, 0, store, "student context so far", learner_id)
+    generation = await generator.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
 
     leaves = [b for b in generation.branches if b.is_leaf]
     target_leaf = max(leaves, key=lambda b: b.depth)
@@ -178,7 +187,7 @@ async def test_resolve_no_match_marks_unmatched_and_logs_explicitly(
     generator = HypothesisGenerator(
         gen_llm, branch_store, BranchBudgetConfig(max_depth=1, max_total_branches=20)
     )
-    generation = await generator.generate(session_id, 0, store, "student context so far", learner_id)
+    generation = await generator.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
     leaves_before = [b for b in generation.branches if b.is_leaf]
     assert leaves_before
 
@@ -207,7 +216,7 @@ async def test_resolve_supersedes_intermediate_open_branches_and_never_deletes(
     generator = HypothesisGenerator(
         gen_llm, branch_store, BranchBudgetConfig(max_depth=2, max_total_branches=20)
     )
-    generation = await generator.generate(session_id, 0, store, "student context so far", learner_id)
+    generation = await generator.generate(session_id, 0, "student context so far", [], _PLANNED_ACTION)
     intermediate = [b for b in generation.branches if not b.is_leaf]
     assert intermediate, "expected at least one non-leaf (intermediate) branch"
 

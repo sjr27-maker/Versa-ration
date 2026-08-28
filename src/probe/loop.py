@@ -1,8 +1,6 @@
-"""The session loop: Diagnose → Infer → Update → Replan → Plan → Teach
-→ wait → repeat.
-
-Test exists as a node class (see nodes.py) but isn't wired into this
-loop yet. That comes with a later step.
+"""The session loop: [BranchResolve] → [AttachTopic] → Diagnose →
+Infer → Update → Replan → Plan → [BranchGenerate → SelectBranch →
+DerivePath] → Teach → wait → repeat.
 
 Diagnose runs first each turn, checking the student's response against
 what was expected from the *previous* turn's Teach output
@@ -36,52 +34,162 @@ HypothesisGenerator (hypothesis_generator.py) is a separate, parallel
 signal — a speculative prediction tree, regenerated every turn,
 distinct from the durable Hypothesis/HypothesisStore this loop already
 threads through Infer/Update/Replan. It's opt-in via `branch_store`
-(`None` reproduces the exact pre-existing turn flow). `resolve()` runs
+(`None` reproduces the exact pre-existing turn flow, minus the
+branch-derived path — Teach then gets `path_requirement=None` and
+falls back to target_concept-only framing). `resolve()` still runs
 first each turn (before Diagnose/Infer touch the student's new
-message), matching it against the *previous* turn's generation;
-`generate()` runs last, after Teach, since it predicts the student's
-reaction to what was just taught and reuses this turn's already-
-computed hypothesis distribution/entropy for its budget — no second
-DB round-trip, and if it fails it can't affect the teaching response
-that already went out.
+message), matching it against the *previous* turn's generation.
+`generate()` now runs *before* Teach, right after Plan: it conditions
+on the student's message (already in transcript_context via
+record_turn), the current hypothesis distribution, and Plan's just-
+decided action/target_concept — not on Teach's rendered text, which
+doesn't exist yet at this point in the turn. `SelectBranch` then picks
+one branch from the tree by *coverage* (how much of the rest of the
+live tree its path would also serve), not raw plausibility, and
+`DerivePath` turns that branch's full root-to-leaf path into a
+`PathRequirement` — what the student appears to believe, what they
+need, and critically what must NOT be assumed as settled. Teach
+receives that PathRequirement instead of the tree itself: a tree
+invites free association, a path constrains. Because generation now
+happens before Teach runs, it happens regardless of whether Teach
+subsequently fails — see the teach_failed handling below for what that
+implies for next turn's resolve().
+
+Topic inference (`AttachTopic`, nodes.py) replaces `--topic`: a
+session may be created with `concept_graph_id=None` (migration 013),
+and its first turn (`turn_index == 0`) runs `AttachTopic` against the
+student's message to attach one — best-effort; a failure there is
+recorded as a warning and the turn continues with graceful degradation
+(Diagnose already handles a None graph gracefully). Any turn *past*
+the first with a still-null `concept_graph_id` is a structural
+invariant violation, not a transient failure — `SessionMissingTopicError`
+propagates out of `handle_turn` uncaught.
+
+Per-node error handling: every node call between (not including) the
+topic check and Teach is wrapped so its failure doesn't lose the turn
+— caught, recorded as a warning string, and replaced with a safe
+neutral fallback for whatever it would have returned. Teach has no
+such fallback (its output *is* the turn): a Teach failure returns a
+fixed in-band message instead of raising and sets
+`turn_diagnostics.teach_failed`. BranchGenerate/SelectBranch/DerivePath
+are no longer conditioned on teach_failed at all — they run before
+Teach, so Teach's outcome isn't even known yet at that point; a Teach
+failure is recorded as a warning alongside a kept (not discarded)
+generation instead.
+
+`turn_diagnostics` (diagnostics.py) is written once per turn, opt-in
+via `diagnostics_store` (`None` skips recording, same backward-
+compatible pattern as `branch_store`) — the persisted form of
+everything this module already computes each turn, so the web UI's
+Diagnostics panel reads it directly instead of re-deriving anything.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
 from probe.audit import NodeCallStore, TranscriptStore
 from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph
+from probe.diagnostics import TurnDiagnosticsStore
 from probe.grounding import GroundConcept
 from probe.hypothesis_generator import (
     BranchGenerate,
     BranchResolve,
+    DerivePath,
     HypothesisGenerator,
+    SelectBranch,
+    build_branch_path,
 )
 from probe.llm import LLMClient, ModelTierClients
 from probe.mismatch import MismatchDetector
+from probe.models import CandidateAction, PlanOutput, TeachingAction, TurnDiagnostics
 from probe.nodes import (
     DEFAULT_GENERATION_WIDTH,
     MAX_CALLS_PER_TURN,
+    AttachTopic,
     Diagnose,
     Infer,
     Plan,
     Replan,
+    SessionMissingTopicError,
     Teach,
     Test,
     Update,
 )
 from probe.overlay import LearnerOverlay
-from probe.reasoning_budget import BranchBudgetConfig, ReasoningBudgetConfig
+from probe.reasoning_budget import (
+    BranchBudgetConfig,
+    ReasoningBudgetConfig,
+    compute_reasoning_budget,
+)
 from probe.revision import WorldModelRevisionStore
 from probe.store import HypothesisStore
 from probe.value_function import ValueFunction, ValueFunctionConfig
 
 logger = logging.getLogger(__name__)
+
+# Consecutive turns with no grounded concept before it's surfaced as an
+# "off_graph_drift" warning. Arbitrary starting point, not measured —
+# same honesty as every other placeholder threshold in this codebase;
+# revisit once real session data exists. Never triggers a reseed on
+# its own — purely a surfaced signal (see module docstring).
+_OFF_GRAPH_DRIFT_THRESHOLD = 3
+
+# Deterministic, no-LLM-call fallback for a turn whose Plan failed
+# entirely — the same enum-order choice _backfill() already uses when
+# the proposer returns too few candidates, just applied to "zero
+# candidates scored at all" instead of "some."
+_PLAN_FALLBACK_ACTION = TeachingAction.EXPLAIN
+
+_TEACH_FAILURE_MESSAGE = (
+    "the tutor failed to respond this turn — see Diagnostics for the "
+    "error; try sending your message again"
+)
+
+# Diagnose's own "nothing grounded / nothing to say" shape (see
+# nodes.py, Diagnose.run()'s initial `result` dict) — reused here as
+# the fallback when Diagnose itself raises, so downstream code (the
+# off-graph-drift check, the guardrail sum) doesn't need a second shape
+# to handle.
+def _total_retry_count(tiers: ModelTierClients) -> int:
+    """Sum of GeminiLLMClient.retry_count across every distinct client
+    in `tiers`, deduplicated by identity. Dedup matters because the
+    default (no explicit model_tier_clients) is the *same* LLMClient
+    instance for fast/capable/best — summing all three unguarded would
+    triple-count. getattr(..., 0) makes this 0 for StubLLMClient (no
+    retry mechanism to count) without either client type needing to
+    know about the other.
+
+    Called once at the start and once at the end of handle_turn; the
+    delta is that turn's retry_count (same before/after snapshot
+    pattern as duration_ms's time.monotonic() call)."""
+    seen: set[int] = set()
+    total = 0
+    for client in (tiers.fast, tiers.capable, tiers.best):
+        if id(client) in seen:
+            continue
+        seen.add(id(client))
+        total += getattr(client, "retry_count", 0)
+    return total
+
+
+_DIAGNOSE_FALLBACK: dict[str, Any] = {
+    "classification": "unknown",
+    "matched_expectation": False,
+    "notes": "Diagnose failed this turn — see warnings",
+    "grounding": None,
+    "mismatch": None,
+    "action_taken": "none",
+    "revision_id": None,
+    "reweighted_hypothesis_ids": [],
+    "llm_call_count": 0,
+}
 
 
 class SessionLoop:
@@ -99,6 +207,8 @@ class SessionLoop:
         model_tier_clients: ModelTierClients | None = None,
         branch_store: BranchStore | None = None,
         branch_budget_config: BranchBudgetConfig | None = None,
+        diagnostics_store: TurnDiagnosticsStore | None = None,
+        on_node_start: Callable[[str], None] | None = None,
     ) -> None:
         # Tiering (fast/capable/best -> real Gemini models, see
         # model_config.py) is opt-in via model_tier_clients. Omitting it
@@ -106,9 +216,16 @@ class SessionLoop:
         # the single `llm` argument, which is what every existing test
         # still does and must keep doing unchanged.
         tiers = model_tier_clients or ModelTierClients(fast=llm, capable=llm, best=llm)
+        # Kept on self so handle_turn can snapshot _total_retry_count(...)
+        # before/after each turn — see that function's docstring.
+        self._tiers = tiers
         self._hyp = hypothesis_store
         self._transcript = transcript
         self._node_calls = node_calls
+        self._concepts = concept_graph
+        self._learner_overlay = learner_overlay
+        self._diagnostics = diagnostics_store
+        self._on_node_start = on_node_start
         # Kept separately from self.value_function.config so the
         # per-turn run_information_value toggle can be ANDed against
         # the caller's original intent instead of overwriting it —
@@ -120,9 +237,8 @@ class SessionLoop:
             else True
         )
         # Tier assignment: fast -> Infer, GroundConcept, MismatchDetector,
-        # ValueFunction terms; capable -> Plan's proposer (seed_graph is
-        # wired separately, from cli.py, since it isn't part of this
-        # loop); best -> Teach.
+        # ValueFunction terms, AttachTopic's topic extraction; capable ->
+        # Plan's proposer, AttachTopic's seed_graph delegation; best -> Teach.
         self.value_function = ValueFunction(tiers.fast, value_function_config)
         self.infer = Infer(tiers.fast)
         self.plan = Plan(self.value_function, tiers.capable)
@@ -139,15 +255,20 @@ class SessionLoop:
             learner_overlay=learner_overlay,
             transcript=transcript,
         )
+        self.attach_topic = AttachTopic(
+            tiers.fast, tiers.capable, concept_graph, transcript
+        )
         self._generation_width: int = DEFAULT_GENERATION_WIDTH
         self._exploration_target = None
         self._last_teach_message: str = ""
+        self._consecutive_ungrounded_turns: int = 0
 
         # HypothesisGenerator is opt-in: branch_store=None (the default,
         # and what every existing test still passes) reproduces the
         # exact pre-existing turn flow — generate()/resolve() are simply
         # never called. Tier: fast, same reasoning as GroundConcept/
         # MismatchDetector (fires every turn, multiplies fast).
+        self._branch_store = branch_store
         self._prior_generation_id = None
         if branch_store is not None:
             self._hypothesis_generator = HypothesisGenerator(
@@ -159,12 +280,16 @@ class SessionLoop:
             self.branch_resolve: BranchResolve | None = BranchResolve(
                 self._hypothesis_generator
             )
+            self.select_branch: SelectBranch | None = SelectBranch(tiers.fast)
+            self.derive_path: DerivePath | None = DerivePath(tiers.fast)
         else:
             self.branch_generate = None
             self.branch_resolve = None
+            self.select_branch = None
+            self.derive_path = None
 
     async def run_interactive(
-        self, learner_id: UUID, concept_graph_id: UUID
+        self, learner_id: UUID, concept_graph_id: UUID | None
     ) -> UUID:
         session_id = await self._transcript.create_session(
             learner_id, concept_graph_id
@@ -190,18 +315,32 @@ class SessionLoop:
     async def handle_turn(
         self, session_id: UUID, turn_index: int, turn_text: str
     ) -> str:
+        start = time.monotonic()
+        retry_count_start = _total_retry_count(self._tiers)
+        warnings: list[str] = []
+        node_call_counts: dict[str, int] = {}
+
         resolution_call_count = 0
         if self.branch_resolve is not None and self._prior_generation_id is not None:
-            resolution = await self._call_node(
+            resolution = await self._call_node_or_warn(
                 self.branch_resolve,
                 session_id,
                 turn_index,
+                "BranchResolve",
+                None,
+                warnings,
                 session_id=session_id,
                 turn_index=turn_index,
                 actual_turn_text=turn_text,
             )
-            resolution_call_count = resolution.call_count
-            self._prior_generation_id = None
+            if resolution is not None:
+                resolution_call_count = resolution.call_count
+                node_call_counts["BranchResolve"] = resolution_call_count
+                self._prior_generation_id = None
+            # else: BranchResolve failed — leave self._prior_generation_id
+            # untouched so next turn's resolve naturally retries against
+            # the same still-open generation, rather than silently
+            # abandoning it.
 
         turn_id = await self._transcript.record_turn(
             session_id, turn_index, turn_text
@@ -212,51 +351,123 @@ class SessionLoop:
         # constraint not to change Diagnose's existing logic.
         learner_id = await self._transcript.get_learner_id(session_id)
 
-        diagnose_result = await self._call_node(
+        # Topic inference: a session created with no topic
+        # (concept_graph_id is None, migration 013) gets one attached
+        # here, on its first turn only. Best-effort — AttachTopic
+        # failing doesn't crash the turn; Diagnose already degrades
+        # gracefully against a still-null graph. Any turn past the
+        # first with a still-null graph is a structural bug, not a
+        # transient failure, so it hard-fails instead.
+        inferred_topic: str | None = None
+        topic_seeded_new: bool | None = None
+        current_graph_id = await self._transcript.get_concept_graph_id(session_id)
+        if current_graph_id is None:
+            if turn_index == 0:
+                try:
+                    attachment = await self._call_node(
+                        self.attach_topic,
+                        session_id,
+                        turn_index,
+                        message=turn_text,
+                        session_id=session_id,
+                    )
+                    node_call_counts["AttachTopic"] = self.attach_topic.last_call_count
+                    inferred_topic = attachment.topic
+                    topic_seeded_new = attachment.seeded_new
+                    current_graph_id = attachment.concept_graph_id
+                    logger.info(
+                        "AttachTopic: session %s attached to topic %r "
+                        "(concept_graph_id=%s, seeded_new=%s)",
+                        session_id,
+                        attachment.topic,
+                        attachment.concept_graph_id,
+                        attachment.seeded_new,
+                    )
+                except Exception as exc:
+                    warnings.append(f"AttachTopic failed: {exc}")
+                    logger.warning(
+                        "AttachTopic failed on turn 0 for session %s: %s",
+                        session_id,
+                        exc,
+                        exc_info=True,
+                    )
+            else:
+                raise SessionMissingTopicError(
+                    f"session {session_id} has no concept_graph_id attached "
+                    f"by turn {turn_index} — AttachTopic only ever runs on "
+                    "turn 0"
+                )
+
+        diagnose_result = await self._call_node_or_warn(
             self.diagnose,
             session_id,
             turn_index,
+            "Diagnose",
+            dict(_DIAGNOSE_FALLBACK),
+            warnings,
             response=turn_text,
             expectation=self._last_teach_message,
             session_id=session_id,
             turn_id=turn_id,
         )
+        node_call_counts["Diagnose"] = diagnose_result["llm_call_count"]
 
-        active_hypotheses = await self._hyp.list_all()
+        grounding = diagnose_result.get("grounding")
+        ungrounded_this_turn = grounding is None or grounding.get("concept_id") is None
+        if ungrounded_this_turn:
+            self._consecutive_ungrounded_turns += 1
+        else:
+            self._consecutive_ungrounded_turns = 0
+        if self._consecutive_ungrounded_turns >= _OFF_GRAPH_DRIFT_THRESHOLD:
+            warnings.append(
+                f"off_graph_drift: {self._consecutive_ungrounded_turns} "
+                "consecutive turns with no grounded concept"
+            )
 
-        proposals = await self._call_node(
+        # Learner-scoped everywhere now, not list_all(): a turn must
+        # never be shown, propose evidence against, or budget reasoning
+        # from another learner's hypotheses. list_all() has no learner
+        # filter at all — see CLAUDE.md / the entropy-contamination fix
+        # this followed. Infer's own hallucination-rejection (nodes.py)
+        # is what actually makes "never reweight another learner's
+        # hypothesis" true, not just "won't see one" — this scoping is
+        # what makes that check meaningful in the first place.
+        active_hypotheses = await self._hyp.list_by_learner(learner_id)
+
+        proposals = await self._call_node_or_warn(
             self.infer,
             session_id,
             turn_index,
+            "Infer",
+            [],
+            warnings,
             turn_text=turn_text,
             hypotheses=active_hypotheses,
             generation_width=self._generation_width,
         )
+        node_call_counts["Infer"] = self.infer.last_call_count
 
-        await self._call_node(
+        await self._call_node_or_warn(
             self.update,
             session_id,
             turn_index,
+            "Update",
+            [],
+            warnings,
             proposals=proposals,
             hypothesis_store=self._hyp,
         )
 
-        refreshed_hypotheses = await self._hyp.list_all()
-        # Learner-scoped, not list_all(): Replan's entropy must reflect
-        # this session's own learner's uncertainty, not every
-        # hypothesis in the database across every learner/session —
-        # list_all() has no such filter (a pre-existing gap, not
-        # introduced by this fix). Plan/exploration_target below still
-        # use the unscoped refreshed_hypotheses, unchanged — that's the
-        # same class of bug but wasn't in scope for this fix; flagged,
-        # not silently carried along as if it were addressed too.
-        learner_hypotheses = await self._hyp.list_by_learner(learner_id)
+        refreshed_hypotheses = await self._hyp.list_by_learner(learner_id)
 
-        budget = await self._call_node(
+        budget = await self._call_node_or_warn(
             self.replan,
             session_id,
             turn_index,
-            hypotheses=learner_hypotheses,
+            "Replan",
+            compute_reasoning_budget([]),
+            warnings,
+            hypotheses=refreshed_hypotheses,
         )
         self._generation_width = budget.generation_width
         self._exploration_target = budget.exploration_target
@@ -267,40 +478,159 @@ class SessionLoop:
             self._base_enable_information_value and budget.run_information_value
         )
 
-        plan_output = await self._call_node(
+        plan_fallback = PlanOutput(
+            winner=CandidateAction(
+                action=_PLAN_FALLBACK_ACTION,
+                target_concept=None,
+                rationale="Plan failed this turn — deterministic fallback, no scoring",
+            ),
+            scores=[],
+        )
+        concept_state = await self._build_concept_state(
+            current_graph_id, learner_id, diagnose_result
+        )
+        plan_output = await self._call_node_or_warn(
             self.plan,
             session_id,
             turn_index,
+            "Plan",
+            plan_fallback,
+            warnings,
             hypotheses=refreshed_hypotheses,
-            concept_state={},
+            concept_state=concept_state,
             generation_width=self._generation_width,
             exploration_target=self._exploration_target,
         )
-
-        message = await self._call_node(
-            self.teach,
-            session_id,
-            turn_index,
-            action=plan_output.winner,
+        plan_scoring_calls = sum(
+            s.learning_value_call_count
+            + s.information_value_call_count
+            + s.cognitive_cost_call_count
+            + s.frustration_risk_call_count
+            for s in plan_output.scores
         )
+        node_call_counts["Plan"] = self.plan.last_generate_call_count + plan_scoring_calls
 
+        # BranchGenerate -> SelectBranch -> DerivePath, all before
+        # Teach: the tree now conditions on the student's message
+        # (already in transcript_context via record_turn), the current
+        # hypotheses, and Plan's just-decided action/target_concept —
+        # everything Teach itself would have needed, available without
+        # waiting for Teach's rendered text. This also means generation
+        # happens regardless of whether Teach subsequently fails (see
+        # the teach_failed handling below): nothing about it depends on
+        # Teach succeeding, so there is no "skip generation" case left
+        # to gate on.
         generation_call_count = 0
+        path_requirement = None
         if self.branch_generate is not None:
-            transcript_context = await self._build_transcript_context(
-                session_id, message
-            )
-            generation = await self._call_node(
+            transcript_context = await self._build_transcript_context(session_id)
+            generation = await self._call_node_or_warn(
                 self.branch_generate,
                 session_id,
                 turn_index,
+                "BranchGenerate",
+                None,
+                warnings,
                 session_id=session_id,
                 turn_index=turn_index,
-                hypothesis_store=self._hyp,
                 transcript_context=transcript_context,
-                learner_id=learner_id,
+                hypotheses=refreshed_hypotheses,
+                action=plan_output.winner,
             )
-            generation_call_count = generation.call_count
-            self._prior_generation_id = generation.generation.id
+            if generation is not None:
+                generation_call_count = generation.call_count
+                node_call_counts["BranchGenerate"] = generation_call_count
+                self._prior_generation_id = generation.generation.id
+                for note in generation.redundancy_notes:
+                    warnings.append(f"redundancy_check: {note}")
+
+                if generation.branches and self.select_branch is not None:
+                    selection = await self._call_node_or_warn(
+                        self.select_branch,
+                        session_id,
+                        turn_index,
+                        "SelectBranch",
+                        None,
+                        warnings,
+                        branches=generation.branches,
+                    )
+                    if selection is not None:
+                        node_call_counts["SelectBranch"] = (
+                            self.select_branch.last_call_count
+                        )
+                        await self._branch_store.set_selection(
+                            generation.generation.id,
+                            selection.selected_branch_id,
+                            selection.rationale,
+                        )
+                        if (
+                            selection.selected_branch_id is not None
+                            and self.derive_path is not None
+                        ):
+                            path = build_branch_path(
+                                generation.branches, selection.selected_branch_id
+                            )
+                            path_result = await self._call_node_or_warn(
+                                self.derive_path,
+                                session_id,
+                                turn_index,
+                                "DerivePath",
+                                None,
+                                warnings,
+                                path=path,
+                            )
+                            if path_result is not None:
+                                node_call_counts["DerivePath"] = (
+                                    self.derive_path.last_call_count
+                                )
+                                path_requirement = path_result
+                                await self._branch_store.set_path_requirement(
+                                    generation.generation.id, path_requirement
+                                )
+
+        # Teach has no fallback — its output *is* the turn. A failure
+        # here doesn't crash the turn or the session, but there's no
+        # real teaching content to show either way: a fixed in-band
+        # message takes its place. Unlike before this reorder,
+        # BranchGenerate above already ran regardless — its predictions
+        # target the planned action (Plan's decision), not Teach's
+        # rendered output, so a Teach failure here doesn't invalidate
+        # them. What it does mean: if Teach fails, the student sees
+        # _TEACH_FAILURE_MESSAGE, not the planned lesson, so next
+        # turn's real response is a reaction to a failure notice, not
+        # to what this generation predicted reactions to — flagged
+        # below as a warning so match-rate analysis can see why a
+        # miss happened, not silently misinterpret it as the mechanism
+        # being wrong.
+        teach_failed = False
+        try:
+            message = await self._call_node(
+                self.teach,
+                session_id,
+                turn_index,
+                action=plan_output.winner,
+                student_message=turn_text,
+                path_requirement=path_requirement,
+            )
+            node_call_counts["Teach"] = self.teach.last_call_count
+        except Exception as exc:
+            teach_failed = True
+            message = _TEACH_FAILURE_MESSAGE
+            warnings.append(f"Teach failed: {exc}")
+            logger.warning(
+                "Teach failed on turn %d for session %s: %s",
+                turn_index,
+                session_id,
+                exc,
+                exc_info=True,
+            )
+            node_call_counts["Teach"] = 0
+            if generation_call_count > 0:
+                warnings.append(
+                    "BranchGenerate ran before Teach failed this turn — its "
+                    "predictions target the planned action, not the "
+                    "fallback failure message the student actually saw"
+                )
 
         # Monitoring guardrail, not a hard stop (see MAX_CALLS_PER_TURN):
         # the *complete* per-turn LLM-call count, not an undercount of
@@ -309,59 +639,146 @@ class SessionLoop:
         # Infer, Plan's proposer, and Teach each track their own calls;
         # ValueFunction's four LLM-calling terms are on each candidate's
         # ActionScore; BranchResolve/BranchGenerate's call_count is on
-        # their own return values).
-        plan_scoring_calls = sum(
-            s.learning_value_call_count
-            + s.information_value_call_count
-            + s.cognitive_cost_call_count
-            + s.frustration_risk_call_count
-            for s in plan_output.scores
-        )
+        # their own return values; SelectBranch/DerivePath are each a
+        # single tracked call).
         total_call_count = (
             diagnose_result["llm_call_count"]
             + self.infer.last_call_count
             + self.plan.last_generate_call_count
             + plan_scoring_calls
-            + self.teach.last_call_count
+            + node_call_counts.get("Teach", 0)
             + resolution_call_count
             + generation_call_count
+            + node_call_counts.get("SelectBranch", 0)
+            + node_call_counts.get("DerivePath", 0)
+            + node_call_counts.get("AttachTopic", 0)
         )
-        if total_call_count > MAX_CALLS_PER_TURN:
+        guardrail_fired = total_call_count > MAX_CALLS_PER_TURN
+        if guardrail_fired:
             logger.warning(
                 "turn %d: LLM calls this turn (%d) exceeded "
-                "MAX_CALLS_PER_TURN=%d (Diagnose=%d, Infer=%d, "
-                "Plan.propose=%d, Plan.scoring across %d candidates=%d, "
-                "Teach=%d, BranchResolve=%d, BranchGenerate=%d) — "
-                "continuing without truncating reasoning; this is a "
-                "monitoring guardrail, not a limit",
+                "MAX_CALLS_PER_TURN=%d (%r) — continuing without "
+                "truncating reasoning; this is a monitoring guardrail, "
+                "not a limit",
                 turn_index,
                 total_call_count,
                 MAX_CALLS_PER_TURN,
-                diagnose_result["llm_call_count"],
-                self.infer.last_call_count,
-                self.plan.last_generate_call_count,
-                len(plan_output.scores),
-                plan_scoring_calls,
-                self.teach.last_call_count,
-                resolution_call_count,
-                generation_call_count,
+                node_call_counts,
+            )
+            warnings.append(
+                f"MAX_CALLS_PER_TURN exceeded: {total_call_count} calls "
+                f"(limit {MAX_CALLS_PER_TURN})"
+            )
+
+        if self._diagnostics is not None:
+            await self._diagnostics.record(
+                TurnDiagnostics(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    node_call_counts=node_call_counts,
+                    total_call_count=total_call_count,
+                    guardrail_fired=guardrail_fired,
+                    entropy_bits=budget.entropy_bits,
+                    duration_ms=(time.monotonic() - start) * 1000,
+                    warnings=warnings,
+                    teach_failed=teach_failed,
+                    inferred_topic=inferred_topic,
+                    topic_seeded_new=topic_seeded_new,
+                    retry_count=_total_retry_count(self._tiers) - retry_count_start,
+                )
             )
 
         self._last_teach_message = message
         return message
 
-    async def _build_transcript_context(
-        self, session_id: UUID, teach_message: str
-    ) -> str:
-        """Full session history for HypothesisGenerator.generate() — the
-        student's prior turns plus the message Teach just sent this
-        turn (not yet in the `turns` table; that's student-only), which
-        is the immediate stimulus the generated tree is predicting a
-        reaction to."""
+    async def _build_concept_state(
+        self,
+        current_graph_id: UUID | None,
+        learner_id: UUID,
+        diagnose_result: dict,
+    ) -> dict:
+        """Grounding for Plan's proposer, not curriculum selection: the
+        session's topic, the concepts that actually exist in its graph
+        (so a target_concept can be a real id instead of invented or
+        left null), which one the student's own message was grounded
+        in this turn (Diagnose's GroundConcept result), and the
+        learner's read-only overlay state for those concepts. This
+        does not choose what to teach next — that stays out of scope;
+        it only tells the proposer what's actually in front of it.
+        """
+        if current_graph_id is None:
+            return {}
+        # Three independent reads (graph metadata, concept list, overlay
+        # state) — none depends on another's result, so they're gathered
+        # rather than three sequential round trips.
+        graph_meta, concepts, overlay = await asyncio.gather(
+            self._concepts.get_graph(current_graph_id),
+            self._concepts.list_concepts(current_graph_id),
+            self._learner_overlay.get_overlay_for_graph(learner_id, current_graph_id),
+        )
+        grounding = (
+            diagnose_result.get("grounding")
+            if isinstance(diagnose_result, dict)
+            else None
+        )
+        grounded_concept_id = (
+            grounding.get("concept_id") if isinstance(grounding, dict) else None
+        )
+        return {
+            "topic": graph_meta.topic if graph_meta is not None else None,
+            "concepts": [{"id": c.id, "name": c.name} for c in concepts],
+            "grounded_concept_id": grounded_concept_id,
+            "overlay": {
+                entry.concept_id: {
+                    "state": entry.state.value,
+                    "confidence": entry.confidence,
+                }
+                for entry in overlay
+            },
+        }
+
+    async def _build_transcript_context(self, session_id: UUID) -> str:
+        """Full session history for HypothesisGenerator.generate() —
+        every student turn recorded so far, including this turn's own
+        (record_turn already wrote it earlier in handle_turn). No
+        longer appends a rendered Teach message: generation now runs
+        *before* Teach, so there is nothing yet to append — the tree
+        conditions on Plan's decided action/target_concept instead (see
+        handle_turn), which is available at this point in the turn and
+        Teach's rendered text is not."""
         turns = await self._transcript.list_turns(session_id)
         lines = [f"student (turn {t.turn_index}): {t.text}" for t in turns]
-        lines.append(f"tutor (just now): {teach_message}")
         return "\n".join(lines)
+
+    async def _call_node_or_warn(
+        self,
+        node: Any,
+        session_id: UUID,
+        turn_index: int,
+        label: str,
+        fallback: Any,
+        warnings: list[str],
+        /,
+        **kwargs: Any,
+    ) -> Any:
+        """Same as `_call_node`, except a raised exception is caught,
+        recorded into `warnings`, and swallowed in favor of `fallback`
+        — so one node's transient failure doesn't lose the whole turn.
+        Not used for Teach, which has no safe fallback (see
+        handle_turn's dedicated try/except for that one)."""
+        try:
+            return await self._call_node(node, session_id, turn_index, **kwargs)
+        except Exception as exc:
+            warnings.append(f"{label} failed: {exc}")
+            logger.warning(
+                "%s failed on turn %d for session %s: %s",
+                label,
+                turn_index,
+                session_id,
+                exc,
+                exc_info=True,
+            )
+            return fallback
 
     async def _call_node(
         self,
@@ -374,6 +791,8 @@ class SessionLoop:
         # session_id/turn_index/node are positional-only so a node's own
         # run() kwargs (Diagnose's `session_id`, in particular) can share
         # a name with them without colliding.
+        if self._on_node_start is not None:
+            self._on_node_start(type(node).__name__)
         output = await node.run(**kwargs)
         await self._node_calls.record(
             node_name=type(node).__name__,

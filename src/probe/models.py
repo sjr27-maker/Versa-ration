@@ -53,6 +53,13 @@ class EvidenceRef(BaseModel):
     turn_id: UUID
     polarity: Polarity
     timestamp: datetime = Field(default_factory=_utcnow)
+    # Populated only for evidence a Hypothesis reweight() actually
+    # created (None for add()-time evidence, and always None for a
+    # WorldModelRevision's own evidence_refs, which aren't about a
+    # probability/confidence at all) — the "after" value needed to
+    # show a per-turn delta without recomputing it anywhere else.
+    resulting_probability: float | None = Field(default=None, ge=0.0, le=1.0)
+    resulting_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class Hypothesis(BaseModel):
@@ -177,10 +184,17 @@ class PlanOutput(BaseModel):
     per-candidate score breakdown (for the audit trail). Both survive
     together through `SessionLoop._call_node`'s serialization into
     `node_calls.output_json`.
+
+    `argmax_changes_without_information_value` is necessarily computed
+    here, not on `ActionScore`: it's a property of the *winner
+    selection* across all candidates (would a different one win with
+    information_value zeroed out), which a single candidate's own score
+    has no visibility into.
     """
 
     winner: CandidateAction
     scores: list[ActionScore]
+    argmax_changes_without_information_value: bool = False
 
 
 class ConceptGraphMeta(BaseModel):
@@ -324,6 +338,21 @@ class WorldModelRevision(BaseModel):
     resolved_at: datetime | None = None
 
 
+class NodeCall(BaseModel):
+    """One row from node_calls — for read paths (the web UI) that need
+    a specific past call's input/output rather than just writing new
+    ones (NodeCallStore.record is the only writer, per CLAUDE.md
+    invariant 2)."""
+
+    id: UUID
+    node_name: str
+    session_id: UUID
+    turn_index: int
+    input_json: dict
+    output_json: object
+    timestamp: datetime
+
+
 class TurnRecord(BaseModel):
     """One student turn, as persisted by TranscriptStore.record_turn."""
 
@@ -373,13 +402,56 @@ class Branch(BaseModel):
     created_at: datetime = Field(default_factory=_utcnow)
 
 
+class PathRequirement(BaseModel):
+    """DerivePath's output — what Teach is scoped to this turn, derived
+    from the selected branch's full root-to-leaf path (every ancestor's
+    statement, not just the leaf). Persisted with the generation so the
+    web UI can show exactly what Teach was told, and told not, to say.
+
+    `must_not_assume` is the load-bearing field: anything the path
+    leaves genuinely uncertain (a sign, a value, a condition never
+    stated) that Teach must not present as settled — the mechanism
+    meant to prevent a Teach output that quietly assumes an unstated
+    quantity (e.g. asserting a charge's sign the problem never gave).
+    """
+
+    current_belief: str = ""
+    needed: str = ""
+    must_not_assume: list[str] = Field(default_factory=list)
+    scope: str = ""
+
+
+class BranchSelection(BaseModel):
+    """SelectBranch's output — which branch this turn's teaching should
+    derive from, and why. Selection criterion is coverage (how much of
+    the rest of the live tree this branch's path would also serve), not
+    raw plausibility — see hypothesis_generator._select_prompt.
+    `selected_branch_id` is None only when there was nothing to select
+    from (an empty generation)."""
+
+    selected_branch_id: UUID | None
+    rationale: str = ""
+
+
 class BranchGenerationMeta(BaseModel):
-    """Identity of one full generation event — not its branches."""
+    """Identity of one full generation event — not its branches.
+
+    `selected_branch_id`/`selection_rationale`/`path_requirement` start
+    None (a generation is created before selection runs) and are filled
+    in afterward via BranchStore.set_selection()/set_path_requirement().
+    Selecting one branch is not a commitment — the tree regenerates
+    next turn from what this turn revealed, so an unselected branch is
+    deferred, never discarded; nothing about tiering/supersession
+    changes because of a selection.
+    """
 
     id: UUID = Field(default_factory=uuid4)
     session_id: UUID
     turn_index: int
     root_count: int
+    selected_branch_id: UUID | None = None
+    selection_rationale: str | None = None
+    path_requirement: PathRequirement | None = None
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -396,6 +468,12 @@ class BranchGeneration(BaseModel):
     generation: BranchGenerationMeta
     branches: list[Branch]
     call_count: int = 0
+    # Same facts as the logger.info lines emitted per branch that
+    # clears the redundancy check (see should_expand_branch) — kept
+    # here too, structured, so SessionLoop can fold them into that
+    # turn's turn_diagnostics.warnings for the UI to read directly
+    # instead of re-parsing logs.
+    redundancy_notes: list[str] = Field(default_factory=list)
 
 
 class ResolutionResult(BaseModel):
@@ -407,3 +485,121 @@ class ResolutionResult(BaseModel):
     matched_chain: list[UUID] = Field(default_factory=list)
     status: str  # "matched" | "unmatched"
     call_count: int = 0
+
+
+class TopicAttachment(BaseModel):
+    """AttachTopic's return value: what topic was inferred and which
+    concept_graph_id ended up attached to the session, whether that
+    graph was resumed (an existing exact-topic match) or freshly
+    seeded."""
+
+    topic: str
+    concept_graph_id: UUID
+    seeded_new: bool
+
+
+class HypothesisTierChange(BaseModel):
+    """One row of hypothesis_tier_changes — the trace retier()/
+    resurrect() leave behind, since the hypotheses table itself only
+    ever shows the current tier."""
+
+    id: UUID = Field(default_factory=uuid4)
+    hypothesis_id: UUID
+    old_tier: Tier
+    new_tier: Tier
+    changed_at: datetime = Field(default_factory=_utcnow)
+
+
+class TurnDiagnostics(BaseModel):
+    """One row per handle_turn() call — the persisted form of what
+    loop.py already computes each turn (call counts, the
+    MAX_CALLS_PER_TURN guardrail, entropy_bits, warnings), so the web
+    UI's Diagnostics panel can read it directly instead of re-deriving
+    it. `teach_failed` is checked separately from `warnings` by
+    downstream analysis (branch match rate, portrait stats, call-count
+    aggregates) that needs to exclude turns where no real teaching
+    happened.
+
+    `inferred_topic`/`topic_seeded_new` are AttachTopic's own result —
+    only ever set on turn 0 (the only turn it runs), None every other
+    turn. Persisted specifically so a wrong topic inference is visible
+    immediately in the UI, not something discoverable only by querying
+    node_calls directly.
+
+    `retry_count` is this turn's total across every LLMClient retry
+    (GeminiLLMClient.retry_count, snapshotted before/after the turn —
+    see loop.py's _total_retry_count) — a rate-limited call and a
+    genuinely slow one are otherwise indistinguishable from the outside;
+    this makes throttling visible in the UI instead of only in logs.
+    Always 0 against StubLLMClient (no retry mechanism to count).
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    session_id: UUID
+    turn_index: int
+    node_call_counts: dict[str, int] = Field(default_factory=dict)
+    total_call_count: int = 0
+    guardrail_fired: bool = False
+    entropy_bits: float | None = None
+    duration_ms: float
+    warnings: list[str] = Field(default_factory=list)
+    teach_failed: bool = False
+    inferred_topic: str | None = None
+    topic_seeded_new: bool | None = None
+    retry_count: int = 0
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class SessionSummary(BaseModel):
+    """One row for the Setup page's resume view: a learner's prior
+    session, its inferred topic (None if never attached), and how many
+    turns it has."""
+
+    session_id: UUID
+    concept_graph_id: UUID | None
+    topic: str | None
+    turn_count: int
+    created_at: datetime
+
+
+class BranchMatchRatePoint(BaseModel):
+    """One session's leaf-branch match rate — "does it actually predict
+    me," plotted session over session. Only leaves that reached a
+    terminal status (matched/unmatched) count; a still-open generation
+    (the session's most recent, unresolved one) isn't included."""
+
+    session_id: UUID
+    session_created_at: datetime
+    total_resolved: int
+    matched_count: int
+
+    @property
+    def match_rate(self) -> float:
+        return self.matched_count / self.total_resolved if self.total_resolved else 0.0
+
+
+class LearnerSummary(BaseModel):
+    """One row for the Setup page's existing-learner picker: a learner
+    plus their session count and most recent session's timestamp
+    (None if they have no sessions yet)."""
+
+    learner: Learner
+    session_count: int
+    last_session_at: datetime | None
+
+
+class RecurringIntent(BaseModel):
+    """One depth-0 (root/intent) statement, grouped by exact text
+    across all of a learner's sessions — how often it recurs and how
+    often it ends up matched. Exact-text grouping only: two
+    differently-worded but semantically identical intents are counted
+    separately, same documented limitation as the redundancy check's
+    wording-not-semantics heuristic."""
+
+    statement: str
+    total_count: int
+    matched_count: int
+
+    @property
+    def match_rate(self) -> float:
+        return self.matched_count / self.total_count if self.total_count else 0.0

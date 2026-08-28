@@ -1,10 +1,11 @@
 """SessionLoop's HypothesisGenerator wiring: backward compatibility
 when branch_store is omitted (the default, and what every pre-existing
-SessionLoop test still does), turn ordering (generate() last, after
-Teach; resolve() first, before Diagnose, on the following turn), and
-that MAX_CALLS_PER_TURN's guardrail sum actually includes
-BranchGenerate/BranchResolve's call counts, not just the original five
-nodes.
+SessionLoop test still does), turn ordering (generate() now runs
+before Teach, right after Plan, with SelectBranch/DerivePath between
+them; resolve() still runs first, before Diagnose, on the following
+turn), and that MAX_CALLS_PER_TURN's guardrail sum actually includes
+BranchGenerate/BranchResolve/SelectBranch/DerivePath's call counts,
+not just the original five nodes.
 """
 
 import logging
@@ -62,7 +63,7 @@ async def test_branch_store_none_reproduces_pre_existing_turn_flow(
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_generate_runs_after_teach_and_resolve_runs_before_diagnose_next_turn(
+async def test_generate_runs_before_teach_and_resolve_runs_before_diagnose_next_turn(
     store,
     transcript,
     node_calls,
@@ -104,13 +105,14 @@ async def test_generate_runs_after_teach_and_resolve_runs_before_diagnose_next_t
     turn1_names = [r["node_name"] for r in rows if r["turn_index"] == 1]
 
     assert turn0_names == [
-        "Diagnose", "Infer", "Update", "Replan", "Plan", "Teach", "BranchGenerate",
+        "Diagnose", "Infer", "Update", "Replan", "Plan",
+        "BranchGenerate", "SelectBranch", "DerivePath", "Teach",
     ]
     # No prior generation on turn 0, so no BranchResolve call at all that turn.
     assert "BranchResolve" not in turn0_names
     assert turn1_names[0] == "BranchResolve"  # resolves turn 0's generation first
     assert turn1_names[1] == "Diagnose"
-    assert turn1_names[-1] == "BranchGenerate"
+    assert turn1_names[-1] == "Teach"  # generation now precedes Teach, not after it
     assert gen_count == 2  # one generation per turn
 
 
@@ -161,5 +163,9 @@ async def test_max_calls_per_turn_guardrail_sums_in_branch_calls(
 
     warnings = [r.getMessage() for r in caplog.records if "MAX_CALLS_PER_TURN" in r.message]
     assert warnings
-    assert f"BranchGenerate={branch_generate_calls}" in warnings[0]
-    assert "BranchResolve=0" in warnings[0]  # nothing to resolve on turn 0
+    # The per-node breakdown is now a real dict (also what gets persisted
+    # to turn_diagnostics.node_call_counts), not a hand-formatted string.
+    assert f"'BranchGenerate': {branch_generate_calls}" in warnings[0]
+    # BranchResolve never ran on turn 0 (no prior generation), so it's
+    # simply absent from the breakdown rather than present at 0.
+    assert "BranchResolve" not in warnings[0]

@@ -8,6 +8,7 @@ from probe.audit import NodeCallStore, TranscriptStore
 from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
+from probe.diagnostics import TurnDiagnosticsStore
 from probe.learner import LearnerStore
 from probe.overlay import LearnerOverlay
 from probe.revision import WorldModelRevisionStore
@@ -37,6 +38,8 @@ async def pool():
         # tests only — the stores themselves must never remove rows
         # (CLAUDE.md invariants 1 and 2).
         await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS turn_diagnostics CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS hypothesis_tier_changes CASCADE")
         await conn.execute("DROP TABLE IF EXISTS branches CASCADE")
         await conn.execute("DROP TABLE IF EXISTS branch_generations CASCADE")
         await conn.execute("DROP TABLE IF EXISTS world_model_revision_evidence CASCADE")
@@ -69,7 +72,8 @@ async def pool():
 async def clean_pool(pool):
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE node_calls, turns, sessions, learners, evidence_refs, "
+            "TRUNCATE node_calls, turn_diagnostics, hypothesis_tier_changes, "
+            "turns, sessions, learners, evidence_refs, "
             "hypotheses, learner_overlay, concept_prerequisites, concept_nodes, "
             "concept_graphs, hypothesis_concepts, world_model_revisions, "
             "world_model_revision_evidence, branches, branch_generations "
@@ -111,6 +115,11 @@ async def revision_store(clean_pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def branch_store(clean_pool):
     return BranchStore(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def diagnostics_store(clean_pool):
+    return TurnDiagnosticsStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")

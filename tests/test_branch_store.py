@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 import probe.branches as branches_module
-from probe.models import Branch, BranchStatus
+from probe.models import Branch, BranchStatus, PathRequirement
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -150,6 +150,86 @@ async def test_get_latest_generation_returns_most_recent_by_turn_index(
 
     assert latest is not None
     assert latest.id == second.id
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_new_generation_starts_with_no_selection_or_path(
+    branch_store, transcript, clean_pool, learner_id, concept_graph_id
+):
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    generation = await branch_store.create_generation(session_id, 0, root_count=1)
+
+    assert generation.selected_branch_id is None
+    assert generation.selection_rationale is None
+    assert generation.path_requirement is None
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_set_selection_persists_branch_id_and_rationale(
+    branch_store, transcript, clean_pool, learner_id, concept_graph_id
+):
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    generation = await branch_store.create_generation(session_id, 0, root_count=1)
+    root = Branch(
+        parent_id=None,
+        generation_id=generation.id,
+        session_id=session_id,
+        turn_index=0,
+        depth=0,
+        depth_label="intent",
+        statement="wants an analogy",
+        predicted_next_turn="will ask for a comparison",
+        plausibility=0.6,
+        is_leaf=True,
+    )
+    await branch_store.add_branches([root])
+
+    updated = await branch_store.set_selection(
+        generation.id, root.id, "covers the most sibling ground"
+    )
+    assert updated.selected_branch_id == root.id
+    assert updated.selection_rationale == "covers the most sibling ground"
+
+    refetched = await branch_store.get_latest_generation(session_id)
+    assert refetched.selected_branch_id == root.id
+    assert refetched.selection_rationale == "covers the most sibling ground"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_set_selection_with_none_branch_id_persists_rationale_only(
+    branch_store, transcript, clean_pool, learner_id, concept_graph_id
+):
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    generation = await branch_store.create_generation(session_id, 0, root_count=0)
+
+    updated = await branch_store.set_selection(
+        generation.id, None, "no branches generated this turn"
+    )
+
+    assert updated.selected_branch_id is None
+    assert updated.selection_rationale == "no branches generated this turn"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_set_path_requirement_persists_and_roundtrips(
+    branch_store, transcript, clean_pool, learner_id, concept_graph_id
+):
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    generation = await branch_store.create_generation(session_id, 0, root_count=1)
+    path_requirement = PathRequirement(
+        current_belief="thinks the slope is constant",
+        needed="the idea of a limit",
+        must_not_assume=["the function is linear"],
+        scope="connect average to instantaneous rate",
+    )
+
+    updated = await branch_store.set_path_requirement(generation.id, path_requirement)
+
+    assert updated.path_requirement == path_requirement
+
+    refetched = await branch_store.get_latest_generation(session_id)
+    assert refetched.path_requirement == path_requirement
+    assert refetched.path_requirement.must_not_assume == ["the function is linear"]
 
 
 def test_branches_module_has_no_delete():

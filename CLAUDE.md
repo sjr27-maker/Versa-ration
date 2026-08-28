@@ -17,6 +17,11 @@ optional overrides for the tier→model mapping in `model_config.py` —
 only needed if the defaults there go stale (Gemini preview model ids
 shift over time).
 
+Run `probe web` for the local Streamlit UI (`src/probe/webui/`) —
+setup, running sessions, and the learner portrait, no auth, local
+only. It's additive: every `probe` CLI command (`chat`, `seed-graph`,
+`review-revisions`, `portrait`) still works exactly as before.
+
 ## Invariants
 
 ### 1. The hypothesis store is append-only
@@ -154,3 +159,35 @@ built yet — deliberately deferred until real match data exists to
 define "a pattern that repeats") would ever bridge the two; until
 then, the wall between episodic branches and durable hypotheses is
 itself part of what this invariant protects.
+
+### 7. Turn diagnostics and hypothesis tier changes are append-only
+
+`TurnDiagnosticsStore` (`turn_diagnostics`) and
+`HypothesisStore.list_tier_changes`'s backing table
+(`hypothesis_tier_changes`) must never delete rows. Concretely:
+
+- No `delete` / `remove` methods on either class.
+- No `DELETE` SQL anywhere in `diagnostics.py`, or in `store.py`'s
+  `hypothesis_tier_changes` writes, or in either one's migrations.
+- `turn_diagnostics` has one row per `handle_turn()` call, written
+  once, never updated afterward — a turn's recorded diagnostics
+  (call counts, whether the guardrail fired, warnings, whether Teach
+  failed) are a historical fact the instant that turn finishes.
+- `hypothesis_tier_changes` only ever grows via `retier()`'s INSERT on
+  a real transition — never mutated or pruned.
+- Verified by the same AST-based check used for invariants 1, 4, and 6.
+
+This is a separate invariant from the others, not a restatement of
+any of them: `turn_diagnostics` and `hypothesis_tier_changes` are
+audit trail in the same spirit as `node_calls` (invariant 2), but they
+didn't exist when that invariant was written and are new stores in
+their own right, so they get their own entry rather than being
+silently folded into invariant 2's wording after the fact.
+
+Why: both exist specifically so the web UI can *read* what already
+happened instead of recomputing it — a per-turn call-count breakdown,
+whether `MAX_CALLS_PER_TURN` fired, a hypothesis's tier history. If
+either could be edited or pruned, "zero business logic in the UI"
+would quietly stop being true: a UI that can't trust the record to be
+complete has to start re-deriving things itself, which is exactly the
+failure mode this whole feature was built to avoid.

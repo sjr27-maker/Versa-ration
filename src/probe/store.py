@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
-from probe.models import EvidenceRef, Hypothesis, Layer, Polarity, Tier
+from probe.models import (
+    EvidenceRef,
+    Hypothesis,
+    HypothesisTierChange,
+    Layer,
+    Polarity,
+    Tier,
+)
 
 
 class HypothesisStore:
@@ -275,42 +282,99 @@ class HypothesisStore:
                 )
                 if updated is None:
                     raise KeyError(f"hypothesis {id} not found")
-                await self._insert_evidence(conn, id, evidence_ref)
+                await self._insert_evidence(
+                    conn,
+                    id,
+                    evidence_ref,
+                    resulting_probability=new_probability,
+                    resulting_confidence=new_confidence,
+                )
         return await self._require(id)
 
     async def retier(self, id: UUID, new_tier: Tier) -> Hypothesis:
         async with self._pool.acquire() as conn:
-            updated = await conn.fetchval(
-                """
-                UPDATE hypotheses
-                SET tier = $2, updated_at = NOW()
-                WHERE id = $1
-                RETURNING id
-                """,
-                id,
-                new_tier.value,
-            )
-            if updated is None:
-                raise KeyError(f"hypothesis {id} not found")
+            async with conn.transaction():
+                old_tier_value = await conn.fetchval(
+                    "SELECT tier FROM hypotheses WHERE id = $1", id
+                )
+                if old_tier_value is None:
+                    raise KeyError(f"hypothesis {id} not found")
+                await conn.execute(
+                    """
+                    UPDATE hypotheses
+                    SET tier = $2, updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    id,
+                    new_tier.value,
+                )
+                # Only a real transition leaves a trace — a no-op
+                # retier to the tier a hypothesis already had isn't a
+                # "resurrection" or any other meaningful event.
+                if old_tier_value != new_tier.value:
+                    await conn.execute(
+                        """
+                        INSERT INTO hypothesis_tier_changes (
+                            id, hypothesis_id, old_tier, new_tier, changed_at
+                        ) VALUES ($1, $2, $3, $4, NOW())
+                        """,
+                        uuid4(),
+                        id,
+                        old_tier_value,
+                        new_tier.value,
+                    )
         return await self._require(id)
 
     async def resurrect(self, id: UUID) -> Hypothesis:
         return await self.retier(id, Tier.ACTIVE)
 
+    async def list_tier_changes(self, hypothesis_id: UUID) -> list[HypothesisTierChange]:
+        """The trace retier()/resurrect() leave behind for one
+        hypothesis — chronological, so the web UI's per-turn delta
+        panel can show e.g. "resurrected from dormant" without
+        re-deriving it from anything."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM hypothesis_tier_changes
+                WHERE hypothesis_id = $1
+                ORDER BY changed_at, id
+                """,
+                hypothesis_id,
+            )
+        return [
+            HypothesisTierChange(
+                id=row["id"],
+                hypothesis_id=row["hypothesis_id"],
+                old_tier=Tier(row["old_tier"]),
+                new_tier=Tier(row["new_tier"]),
+                changed_at=row["changed_at"],
+            )
+            for row in rows
+        ]
+
     async def _insert_evidence(
-        self, conn: asyncpg.Connection, hypothesis_id: UUID, ref: EvidenceRef
+        self,
+        conn: asyncpg.Connection,
+        hypothesis_id: UUID,
+        ref: EvidenceRef,
+        resulting_probability: float | None = None,
+        resulting_confidence: float | None = None,
     ) -> None:
         await conn.execute(
             """
             INSERT INTO evidence_refs (
-                id, hypothesis_id, turn_id, polarity, timestamp
-            ) VALUES ($1, $2, $3, $4, $5)
+                id, hypothesis_id, turn_id, polarity, timestamp,
+                resulting_probability, resulting_confidence
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
             """,
             ref.id,
             hypothesis_id,
             ref.turn_id,
             ref.polarity.value,
             ref.timestamp,
+            resulting_probability,
+            resulting_confidence,
         )
 
     async def _require(self, id: UUID) -> Hypothesis:
@@ -328,6 +392,8 @@ class HypothesisStore:
                 turn_id=ev["turn_id"],
                 polarity=Polarity(ev["polarity"]),
                 timestamp=ev["timestamp"],
+                resulting_probability=ev["resulting_probability"],
+                resulting_confidence=ev["resulting_confidence"],
             )
             if ref.polarity is Polarity.SUPPORTING:
                 supporting.append(ref)

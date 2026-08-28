@@ -69,6 +69,26 @@ class LearnerOverlay:
             )
         return self._row_to_entry(row) if row is not None else None
 
+    async def get_overlay_for_graph(
+        self, learner_id: UUID, concept_graph_id: UUID
+    ) -> list[OverlayEntry]:
+        """A learner's overlay entries scoped to one concept graph —
+        for SessionLoop building this turn's concept_state (Plan's
+        grounding context), which only ever needs the current session's
+        graph, not every graph the learner has ever touched."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT concept_graph_id, concept_id, state, confidence, updated_at
+                FROM learner_overlay
+                WHERE learner_id = $1 AND concept_graph_id = $2
+                ORDER BY concept_id
+                """,
+                learner_id,
+                concept_graph_id,
+            )
+        return [self._row_to_entry(row) for row in rows]
+
     async def get_full_overlay(self, learner_id: UUID) -> list[OverlayEntry]:
         """Every overlay entry for this learner, across every graph
         they've touched. Returned as a list, not a dict keyed by

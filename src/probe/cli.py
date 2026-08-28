@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from uuid import UUID
 
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ from probe.audit import NodeCallStore, TranscriptStore
 from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph, ConceptValidationError
 from probe.db import create_pool
+from probe.diagnostics import TurnDiagnosticsStore
 from probe.learner import LearnerStore
 from probe.llm import LLMClient, ModelTierClients, StubLLMClient, build_tier_clients
 from probe.loop import SessionLoop
@@ -176,6 +178,7 @@ async def _chat(learner_spec: str, topic_spec: str, use_stub: bool) -> None:
             llm=tiers.fast,
             model_tier_clients=tiers,
             branch_store=BranchStore(pool),
+            diagnostics_store=TurnDiagnosticsStore(pool),
         )
         await loop.run_interactive(learner.id, graph_meta.id)
     finally:
@@ -327,6 +330,19 @@ async def _portrait(learner_id_str: str) -> None:
         await pool.close()
 
 
+def _web() -> None:
+    """`probe web` — one command to launch the Streamlit UI. Shells out
+    to `streamlit run` rather than importing streamlit here, so this
+    module (and every other CLI command) has no dependency on the web
+    UI even existing; `probe web` is the only path that touches it."""
+    import subprocess
+
+    app_path = Path(__file__).resolve().parent / "webui" / "app.py"
+    subprocess.run(
+        [sys.executable, "-m", "streamlit", "run", str(app_path)], check=False
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="probe")
     subparsers = parser.add_subparsers(dest="command")
@@ -373,6 +389,11 @@ def main() -> None:
         help="read-only report of what probe has learned about a learner",
     )
     portrait_parser.add_argument("learner_id", help="learner id (UUID)")
+    subparsers.add_parser(
+        "web",
+        help="launch the local Streamlit web UI (replaces `chat`/`portrait`/"
+        "`review-revisions` for interactive use; those commands still work)",
+    )
     args = parser.parse_args()
 
     if args.command == "chat":
@@ -383,6 +404,8 @@ def main() -> None:
         asyncio.run(_review_revisions())
     elif args.command == "portrait":
         asyncio.run(_portrait(args.learner_id))
+    elif args.command == "web":
+        _web()
     else:
         parser.print_help()
         sys.exit(1)

@@ -21,6 +21,7 @@ that do, each delegating to a shared `HypothesisGenerator` instance.
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import logging
@@ -28,13 +29,21 @@ from uuid import UUID
 
 from probe.branches import BranchStore
 from probe.llm import LLMClient
-from probe.models import Branch, BranchGeneration, BranchStatus, ResolutionResult
+from probe.models import (
+    Branch,
+    BranchGeneration,
+    BranchSelection,
+    BranchStatus,
+    CandidateAction,
+    Hypothesis,
+    PathRequirement,
+    ResolutionResult,
+)
 from probe.reasoning_budget import (
     BranchBudget,
     BranchBudgetConfig,
     compute_branch_budget,
 )
-from probe.store import HypothesisStore
 
 logger = logging.getLogger(__name__)
 
@@ -158,14 +167,34 @@ def _parse_resolve_response(raw: str, valid_ids: set[UUID]) -> UUID | None:
     return candidate
 
 
-def _intent_prompt(transcript_context: str, budget: BranchBudget) -> str:
+def _intent_prompt(
+    transcript_context: str,
+    hypotheses: list[Hypothesis],
+    action: CandidateAction,
+    budget: BranchBudget,
+) -> str:
     lo, hi = budget.root_branch_range
+    hyp_listing = (
+        "\n".join(
+            f"- [{h.layer.value}] {h.statement} (p={h.probability:.2f})"
+            for h in hypotheses
+        )
+        or "(no active hypotheses yet)"
+    )
+    action_desc = action.action.value
+    if action.target_concept:
+        action_desc += f" (target concept: {action.target_concept})"
     return (
         "GENERATE:INTENT\n"
-        f"Given the full session context below, propose between {lo} and {hi} "
-        "distinct, plausible intents for why the student sent their last "
-        "message — genuinely different bets, not rephrasings of one idea.\n\n"
         f"session context:\n{transcript_context}\n\n"
+        f"current hypotheses about the student:\n{hyp_listing}\n\n"
+        f"the tutor is about to take this action: {action_desc}, "
+        f"rationale: {action.rationale}\n\n"
+        f"Given all of the above, propose between {lo} and {hi} distinct, "
+        "plausible intents for why the student sent their last message, "
+        "and how they are likely to react once the tutor's planned action "
+        "happens — genuinely different bets, not rephrasings of one "
+        "idea.\n\n"
         'Respond with JSON: [{"statement": "...", "plausibility": 0.0-1.0, '
         '"predicted_next_turn": "a concrete, checkable prediction of what '
         'the student will say or do next if this intent is true"}, ...]'
@@ -188,6 +217,116 @@ def _expand_prompt(parent: Branch, budget: BranchBudget) -> str:
         '[{"statement": "...", "plausibility": 0.0-1.0, "predicted_next_turn": '
         '"a concrete, checkable prediction of what the student will say or '
         'do next if this branch is true"}, ...]}'
+    )
+
+
+def build_branch_path(branches: list[Branch], selected_id: UUID) -> list[Branch]:
+    """Root-to-leaf inclusive chain ending at `selected_id`, built from
+    an in-memory branch list (a just-generated tree already holds every
+    ancestor of anything in it) rather than round-tripping to the DB —
+    depth 0's intent, every intermediate layer, and the selected branch
+    itself, in that order. `selected_id` need not be an actual leaf:
+    SelectBranch can pick any branch in the tree."""
+    by_id = {b.id: b for b in branches}
+    chain: list[Branch] = []
+    current: Branch | None = by_id.get(selected_id)
+    while current is not None:
+        chain.append(current)
+        current = by_id.get(current.parent_id) if current.parent_id else None
+    chain.reverse()
+    return chain
+
+
+def _select_prompt(branches: list[Branch]) -> str:
+    listing = "\n".join(
+        f"- id={b.id} depth={b.depth} parent={b.parent_id} "
+        f"plausibility={b.plausibility:.2f} [{b.depth_label}]: {b.statement}"
+        for b in branches
+    )
+    return (
+        "SELECT:BRANCH\n"
+        "Below is this turn's full generated tree of plausible student "
+        "intents, knowledge gaps, and predicted reactions.\n\n"
+        f"{listing}\n\n"
+        "Select ONE branch to teach toward this turn. The question is "
+        "COVERAGE, not likelihood: pick the branch whose path, if taught "
+        "to, would also serve the largest share of the OTHER live "
+        "branches — not necessarily the single most probable one. A "
+        "branch at plausibility 0.6 that covers ground shared by four "
+        "siblings beats one at plausibility 0.85 that only serves "
+        "itself. State which other branches your choice covers and "
+        "why.\n"
+        'Respond with JSON: {"selected_branch_id": "<id>", '
+        '"rationale": "..."}'
+    )
+
+
+def _parse_select_response(
+    raw: str, valid_ids: set[UUID]
+) -> tuple[UUID | None, str]:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None, "<unparseable response>"
+    if not isinstance(parsed, dict):
+        return None, "<response was not a JSON object>"
+    rationale = str(parsed.get("rationale") or "")
+    raw_id = parsed.get("selected_branch_id")
+    if raw_id is None:
+        return None, rationale
+    try:
+        candidate = UUID(str(raw_id))
+    except ValueError:
+        return None, rationale or "<selected_branch_id not a valid UUID>"
+    if candidate not in valid_ids:
+        # Hallucinated id — same validation discipline as
+        # _parse_resolve_response: reject rather than pass through.
+        return None, rationale or "<selected_branch_id not in this generation>"
+    return candidate, rationale
+
+
+def _derive_prompt(path: list[Branch]) -> str:
+    listing = "\n".join(
+        f"- depth={b.depth} [{b.depth_label}]: {b.statement} "
+        f"(predicted reaction: {b.predicted_next_turn})"
+        for b in path
+    )
+    return (
+        "DERIVE:PATH\n"
+        "Below is the full root-to-leaf path this turn's teaching should "
+        "be derived from, from the student's root-level intent down to "
+        "the most specific selected branch.\n\n"
+        f"{listing}\n\n"
+        "From this path, derive what this turn's teaching should do. Be "
+        "precise about what the path actually implies versus what is "
+        "merely possible — do not invent specifics (values, signs, "
+        "conditions) the path does not state.\n"
+        'Respond with JSON: {"current_belief": "what the student appears '
+        'to currently believe, based on this path", "needed": "what they '
+        'must be given to move along this path", "must_not_assume": '
+        '["...", ...] (things this path leaves genuinely uncertain that '
+        'must NOT be stated as settled), "scope": "the concrete scope of '
+        'this turn of teaching — one thing, not a syllabus"}'
+    )
+
+
+def _parse_path_requirement(raw: str) -> PathRequirement:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {}
+    must_not_assume = parsed.get("must_not_assume")
+    return PathRequirement(
+        current_belief=str(parsed.get("current_belief") or ""),
+        needed=str(parsed.get("needed") or ""),
+        must_not_assume=(
+            [str(x) for x in must_not_assume]
+            if isinstance(must_not_assume, list)
+            else []
+        ),
+        scope=str(parsed.get("scope") or ""),
     )
 
 
@@ -223,22 +362,27 @@ class HypothesisGenerator:
         self,
         session_id: UUID,
         turn_index: int,
-        hypothesis_store: HypothesisStore,
         transcript_context: str,
-        learner_id: UUID,
+        hypotheses: list[Hypothesis],
+        action: CandidateAction,
     ) -> BranchGeneration:
-        # Learner-scoped, not list_all(): the budget must reflect this
-        # session's own learner's uncertainty, not every hypothesis in
-        # the database across every learner (see the same fix on
-        # Replan's entropy input, loop.py). Note list_by_learner's own
-        # documented limitation: a hypothesis with no evidence yet
-        # (freshly added, never reweighted) isn't attributable to a
-        # learner and won't be counted here either.
-        active_hypotheses = await hypothesis_store.list_by_learner(learner_id)
-        budget = compute_branch_budget(active_hypotheses, self._budget_config)
+        # `hypotheses` is caller-supplied (SessionLoop's own
+        # refreshed_hypotheses, already learner-scoped via
+        # list_by_learner — see the same fix on Replan's entropy input)
+        # rather than fetched again here: generate() now runs after
+        # Plan in the turn, by which point the loop already has this
+        # exact list in hand, so there is no second DB round-trip and
+        # no risk of it drifting from what Plan itself just scored
+        # against. `action` is Plan's winning CandidateAction — what
+        # the tutor is about to do, the substitute signal for "what's
+        # about to happen" now that generation runs before Teach and
+        # can no longer condition on Teach's rendered text.
+        budget = compute_branch_budget(hypotheses, self._budget_config)
         call_count = 0
 
-        raw = await self._llm.complete(_intent_prompt(transcript_context, budget))
+        raw = await self._llm.complete(
+            _intent_prompt(transcript_context, hypotheses, action, budget)
+        )
         call_count += 1
         root_items = _parse_intent_response(raw)
 
@@ -247,6 +391,7 @@ class HypothesisGenerator:
         )
 
         all_branches: list[Branch] = []
+        redundancy_notes: list[str] = []
         wave: list[Branch] = []
         for item in root_items:
             branch = Branch(
@@ -288,47 +433,59 @@ class HypothesisGenerator:
                     budget,
                 )
                 if survives:
-                    logger.info(
-                        "hypothesis_generator: branch %s (depth=%d, "
-                        "plausibility=%.2f) cleared the redundancy check "
-                        "against siblings %r — reviewable to judge distinct "
-                        "bets vs. rephrasings",
-                        branch.id,
-                        depth,
-                        branch.plausibility,
-                        siblings,
+                    note = (
+                        f"branch {branch.id} (depth={depth}, "
+                        f"plausibility={branch.plausibility:.2f}) cleared the "
+                        f"redundancy check against siblings {siblings!r}"
                     )
+                    logger.info("hypothesis_generator: %s", note)
+                    redundancy_notes.append(note)
                     to_expand.append(branch)
 
             next_wave: list[Branch] = []
-            for parent in to_expand:
-                if len(all_branches) >= budget.max_total_branches:
-                    break
-                raw = await self._llm.complete(_expand_prompt(parent, budget))
-                call_count += 1
-                layer_label, child_items = _parse_expand_response(raw)
-                if not child_items:
-                    # Expansion produced nothing usable — parent stays a
-                    # leaf; it already has its own predicted_next_turn.
-                    continue
-                parent.is_leaf = False
-                for item in child_items:
-                    if len(all_branches) >= budget.max_total_branches:
-                        break
-                    child = Branch(
-                        parent_id=parent.id,
-                        generation_id=generation_meta.id,
-                        session_id=session_id,
-                        turn_index=turn_index,
-                        depth=depth + 1,
-                        depth_label=layer_label,
-                        statement=item["statement"],
-                        predicted_next_turn=item["predicted_next_turn"],
-                        plausibility=item["plausibility"],
-                        is_leaf=True,
+            # Siblings at this depth are independent of each other — the
+            # whole wave's expansion calls fire concurrently rather than
+            # one branch at a time. The only place the sequential version
+            # short-circuited mid-wave was the max_total_branches ceiling
+            # check between parents; that's now checked once before the
+            # wave (skip the wave entirely if already at cap) rather than
+            # between each parent's call. Results/child-trimming below
+            # still enforce the exact same cap on what gets stored — the
+            # only behavioral difference is that a wave straddling the
+            # cap may fire a few more LLM calls than strictly needed
+            # before trimming, never more *branches* than before.
+            if to_expand and len(all_branches) < budget.max_total_branches:
+                raw_results = await asyncio.gather(
+                    *(
+                        self._llm.complete(_expand_prompt(parent, budget))
+                        for parent in to_expand
                     )
-                    next_wave.append(child)
-                    all_branches.append(child)
+                )
+                call_count += len(raw_results)
+                for parent, raw in zip(to_expand, raw_results, strict=True):
+                    layer_label, child_items = _parse_expand_response(raw)
+                    if not child_items:
+                        # Expansion produced nothing usable — parent stays
+                        # a leaf; it already has its own predicted_next_turn.
+                        continue
+                    parent.is_leaf = False
+                    for item in child_items:
+                        if len(all_branches) >= budget.max_total_branches:
+                            break
+                        child = Branch(
+                            parent_id=parent.id,
+                            generation_id=generation_meta.id,
+                            session_id=session_id,
+                            turn_index=turn_index,
+                            depth=depth + 1,
+                            depth_label=layer_label,
+                            statement=item["statement"],
+                            predicted_next_turn=item["predicted_next_turn"],
+                            plausibility=item["plausibility"],
+                            is_leaf=True,
+                        )
+                        next_wave.append(child)
+                        all_branches.append(child)
 
             wave = next_wave
             depth += 1
@@ -339,6 +496,7 @@ class HypothesisGenerator:
             generation=generation_meta,
             branches=all_branches,
             call_count=call_count,
+            redundancy_notes=redundancy_notes,
         )
 
     async def resolve(
@@ -420,12 +578,12 @@ class BranchGenerate:
         self,
         session_id: UUID,
         turn_index: int,
-        hypothesis_store: HypothesisStore,
         transcript_context: str,
-        learner_id: UUID,
+        hypotheses: list[Hypothesis],
+        action: CandidateAction,
     ) -> BranchGeneration:
         return await self._generator.generate(
-            session_id, turn_index, hypothesis_store, transcript_context, learner_id
+            session_id, turn_index, transcript_context, hypotheses, action
         )
 
 
@@ -437,3 +595,66 @@ class BranchResolve:
         self, session_id: UUID, turn_index: int, actual_turn_text: str
     ) -> ResolutionResult:
         return await self._generator.resolve(session_id, turn_index, actual_turn_text)
+
+
+class SelectBranch:
+    """Picks one branch from a just-generated tree for this turn's
+    teaching to derive from. Not a HypothesisGenerator method (unlike
+    generate()/resolve(), it needs no BranchStore access — it only
+    reasons over the branch list already returned by BranchGenerate) —
+    a standalone Node like Teach/Plan, fast tier.
+
+    A parse failure or missing selection falls back to the highest-
+    plausibility branch, deterministically and without a further LLM
+    call — same discipline as Plan's _backfill: DerivePath always needs
+    *something* to build a path from, so "nothing selected" is not an
+    acceptable terminal outcome the way "no match" is for resolve().
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        self.last_call_count: int = 0
+
+    async def run(self, branches: list[Branch]) -> BranchSelection:
+        self.last_call_count = 0
+        if not branches:
+            return BranchSelection(
+                selected_branch_id=None, rationale="no branches generated this turn"
+            )
+        raw = await self._llm.complete(_select_prompt(branches))
+        self.last_call_count += 1
+        selected_id, rationale = _parse_select_response(
+            raw, {b.id for b in branches}
+        )
+        if selected_id is not None:
+            return BranchSelection(selected_branch_id=selected_id, rationale=rationale)
+        fallback = max(branches, key=lambda b: b.plausibility)
+        return BranchSelection(
+            selected_branch_id=fallback.id,
+            rationale=(
+                "fallback: no valid selection from the model "
+                f"({rationale or 'no rationale given'}) — defaulted to the "
+                "highest-plausibility branch"
+            ),
+        )
+
+
+class DerivePath:
+    """Turns a selected branch's full root-to-leaf path into the
+    PathRequirement that scopes Teach — see PathRequirement's docstring
+    for why `must_not_assume` is the field that matters most. Fast
+    tier, one LLM call. A parse failure degrades to an empty-but-valid
+    PathRequirement (all blank/empty fields) rather than raising —
+    Teach then simply gets less scoping, the same graceful-degradation
+    discipline as a missing topic did before this feature existed.
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        self.last_call_count: int = 0
+
+    async def run(self, path: list[Branch]) -> PathRequirement:
+        self.last_call_count = 0
+        raw = await self._llm.complete(_derive_prompt(path))
+        self.last_call_count += 1
+        return _parse_path_requirement(raw)

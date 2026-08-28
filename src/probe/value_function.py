@@ -16,6 +16,7 @@ folded into `total` — see `FLAG_NEGATIVE_INFORMATION_VALUE`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -129,7 +130,22 @@ class ValueFunction:
         hypotheses: list[Hypothesis],
         concept_state: dict,
     ) -> float:
-        self._last_learning_value_call_count = 0
+        value, count = await self._learning_value_impl(action, hypotheses, concept_state)
+        self._last_learning_value_call_count = count
+        return value
+
+    async def _learning_value_impl(
+        self,
+        action: CandidateAction,
+        hypotheses: list[Hypothesis],
+        concept_state: dict,
+    ) -> tuple[float, int]:
+        # Returns (value, call_count) instead of writing to
+        # self._last_learning_value_call_count directly: score() gathers
+        # this concurrently across candidates that share one ValueFunction
+        # instance, so a shared instance attribute would race across
+        # candidates. The public method above still sets the attribute,
+        # for a solo/direct call (and the one existing test asserting it).
         prompt = (
             "SCORE:LEARNING_VALUE\n"
             f"action={action.action.value}\n"
@@ -142,15 +158,25 @@ class ValueFunction:
             "Respond with a single float."
         )
         value = await self._ask_scalar(prompt)
-        self._last_learning_value_call_count += 1
-        return value
+        return value, 1
 
     async def information_value(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
     ) -> float:
-        self._last_info_call_count = 0
+        value, count = await self._information_value_impl(action, hypotheses)
+        self._last_info_call_count = count
+        return value
+
+    async def _information_value_impl(
+        self, action: CandidateAction, hypotheses: list[Hypothesis]
+    ) -> tuple[float, int]:
+        # Same (value, call_count) convention as _learning_value_impl —
+        # see its comment. This one also gathers its own nested per-
+        # response SCORE:INFO_UPDATE calls concurrently: each response
+        # simulation is independent of the others (they all read the
+        # same `hypotheses` snapshot and don't mutate shared state).
         if not hypotheses:
-            return 0.0
+            return 0.0, 0
 
         h_before = sum(_bernoulli_entropy(h.probability) for h in hypotheses)
 
@@ -162,30 +188,37 @@ class ValueFunction:
             'Respond with JSON: [{"response": "...", "probability": 0.5}, ...]'
         )
         raw = await self._llm.complete(responses_prompt)
-        self._last_info_call_count += 1
+        call_count = 1
         try:
             responses = json.loads(raw)
         except json.JSONDecodeError:
-            return 0.0
+            return 0.0, call_count
         if not isinstance(responses, list) or not responses:
-            return 0.0
+            return 0.0, call_count
 
-        expected_h_after = 0.0
-        for entry in responses:
-            if not isinstance(entry, dict):
-                continue
-            prob = float(entry.get("probability", 0.0))
-            response_text = entry.get("response", "")
-            update_prompt = (
+        # Non-dict entries never made an UPDATE call in the original
+        # sequential version either (the `continue` skipped straight past
+        # it) — filtered out before gathering so call_count matches.
+        entries = [e for e in responses if isinstance(e, dict)]
+
+        def _update_prompt(entry: dict) -> str:
+            return (
                 "SCORE:INFO_UPDATE\n"
-                f"response={response_text}\n"
+                f"response={entry.get('response', '')}\n"
                 "hypotheses:\n"
                 f"{_hypothesis_listing(hypotheses)}\n"
                 "For each hypothesis id, estimate its new probability given "
                 'this response. Respond with JSON: {"<hyp_id>": <new_prob>}'
             )
-            raw_update = await self._llm.complete(update_prompt)
-            self._last_info_call_count += 1
+
+        raw_updates = await asyncio.gather(
+            *(self._llm.complete(_update_prompt(entry)) for entry in entries)
+        )
+        call_count += len(raw_updates)
+
+        expected_h_after = 0.0
+        for entry, raw_update in zip(entries, raw_updates, strict=True):
+            prob = float(entry.get("probability", 0.0))
             try:
                 update = json.loads(raw_update)
             except json.JSONDecodeError:
@@ -217,7 +250,7 @@ class ValueFunction:
                 expected_h_after,
                 gain,
             )
-        return gain
+        return gain, call_count
 
     async def long_term_value(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
@@ -237,7 +270,13 @@ class ValueFunction:
     async def cognitive_cost(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
     ) -> float:
-        self._last_cognitive_cost_call_count = 0
+        value, count = await self._cognitive_cost_impl(action, hypotheses)
+        self._last_cognitive_cost_call_count = count
+        return value
+
+    async def _cognitive_cost_impl(
+        self, action: CandidateAction, hypotheses: list[Hypothesis]
+    ) -> tuple[float, int]:
         cog_hyps = [h for h in hypotheses if h.layer is Layer.COGNITIVE_STATE]
         prompt = (
             "SCORE:COGNITIVE_COST\n"
@@ -249,13 +288,18 @@ class ValueFunction:
             "Respond with a single float."
         )
         value = await self._ask_scalar(prompt)
-        self._last_cognitive_cost_call_count += 1
-        return value
+        return value, 1
 
     async def frustration_risk(
         self, action: CandidateAction, hypotheses: list[Hypothesis]
     ) -> float:
-        self._last_frustration_risk_call_count = 0
+        value, count = await self._frustration_risk_impl(action, hypotheses)
+        self._last_frustration_risk_call_count = count
+        return value
+
+    async def _frustration_risk_impl(
+        self, action: CandidateAction, hypotheses: list[Hypothesis]
+    ) -> tuple[float, int]:
         cog_hyps = [h for h in hypotheses if h.layer is Layer.COGNITIVE_STATE]
         prompt = (
             "SCORE:FRUSTRATION_RISK\n"
@@ -268,8 +312,7 @@ class ValueFunction:
             "Respond with a single float."
         )
         value = await self._ask_scalar(prompt)
-        self._last_frustration_risk_call_count += 1
-        return value
+        return value, 1
 
     async def score(
         self,
@@ -280,46 +323,45 @@ class ValueFunction:
         cfg = self._config
         active = [h for h in hypotheses if h.tier is Tier.ACTIVE]
 
-        lv = (
-            await self.learning_value(action, active, concept_state)
-            if cfg.enable_learning_value
-            else 0.0
-        )
-        lv_calls = (
-            self._last_learning_value_call_count if cfg.enable_learning_value else 0
-        )
-        iv = (
-            await self.information_value(action, active)
-            if cfg.enable_information_value
-            else 0.0
-        )
-        iv_calls = (
-            self._last_info_call_count if cfg.enable_information_value else 0
-        )
-        ltv = (
-            await self.long_term_value(action, active)
-            if cfg.enable_long_term_value
-            else 0.0
+        # The four LLM-calling terms (plus the no-LLM long_term_value
+        # placeholder) are independent of each other for a single
+        # candidate — gathered concurrently. Each disabled term is a
+        # plain 0.0/no-call coroutine so the gather always has a fixed
+        # shape regardless of config. Call counts come back as part of
+        # each result tuple (via the _impl methods), not through a
+        # shared self._last_*_call_count attribute — score() itself is
+        # gathered *across candidates* by Plan.run() using one shared
+        # ValueFunction instance, so an instance attribute would race
+        # between candidates scored at the same time.
+        async def _lv() -> tuple[float, int]:
+            if not cfg.enable_learning_value:
+                return 0.0, 0
+            return await self._learning_value_impl(action, active, concept_state)
+
+        async def _iv() -> tuple[float, int]:
+            if not cfg.enable_information_value:
+                return 0.0, 0
+            return await self._information_value_impl(action, active)
+
+        async def _ltv() -> float:
+            if not cfg.enable_long_term_value:
+                return 0.0
+            return await self.long_term_value(action, active)
+
+        async def _cc() -> tuple[float, int]:
+            if not cfg.enable_cognitive_cost:
+                return 0.0, 0
+            return await self._cognitive_cost_impl(action, active)
+
+        async def _fr() -> tuple[float, int]:
+            if not cfg.enable_frustration_risk:
+                return 0.0, 0
+            return await self._frustration_risk_impl(action, active)
+
+        (lv, lv_calls), (iv, iv_calls), ltv, (cc, cc_calls), (fr, fr_calls) = (
+            await asyncio.gather(_lv(), _iv(), _ltv(), _cc(), _fr())
         )
         tc = self.time_cost(action) if cfg.enable_time_cost else 0.0
-        cc = (
-            await self.cognitive_cost(action, active)
-            if cfg.enable_cognitive_cost
-            else 0.0
-        )
-        cc_calls = (
-            self._last_cognitive_cost_call_count if cfg.enable_cognitive_cost else 0
-        )
-        fr = (
-            await self.frustration_risk(action, active)
-            if cfg.enable_frustration_risk
-            else 0.0
-        )
-        fr_calls = (
-            self._last_frustration_risk_call_count
-            if cfg.enable_frustration_risk
-            else 0
-        )
 
         total = lv + iv + ltv - tc - cc - fr
 

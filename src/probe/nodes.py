@@ -12,6 +12,7 @@ already-built stores/services.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -28,12 +29,14 @@ from probe.models import (
     EvidenceRef,
     Hypothesis,
     Layer,
+    PathRequirement,
     PlanOutput,
     Polarity,
     ProposedEvidence,
     SuggestedCause,
     TeachingAction,
     Tier,
+    TopicAttachment,
     WorldModelRevision,
 )
 from probe.overlay import LearnerOverlay
@@ -43,6 +46,7 @@ from probe.reasoning_budget import (
     compute_reasoning_budget,
 )
 from probe.revision import WorldModelRevisionStore
+from probe.seed import seed_graph
 from probe.store import HypothesisStore
 from probe.value_function import ValueFunction
 
@@ -120,12 +124,31 @@ class Infer:
             return []
         if not isinstance(parsed, list):
             return []
+        valid_ids = {h.id for h in hypotheses}
         proposals: list[ProposedEvidence] = []
         for item in parsed:
             try:
-                proposals.append(ProposedEvidence.model_validate(item))
+                proposal = ProposedEvidence.model_validate(item)
             except Exception:
                 continue
+            if proposal.hypothesis_id not in valid_ids:
+                # Same validation discipline as GroundConcept/Plan:
+                # reject a reference outside the candidate set shown
+                # this turn rather than pass it through. Not just
+                # cosmetic — `hypotheses` is now learner-scoped
+                # (SessionLoop), so this is what actually stops a
+                # hallucinated or copied id from reweighting a
+                # *different* learner's hypothesis; the caller can't
+                # rely on the LLM simply never seeing one.
+                logger.warning(
+                    "Infer: proposal referenced hypothesis_id %s, not in "
+                    "the %d candidates shown this turn — rejected rather "
+                    "than reweighted",
+                    proposal.hypothesis_id,
+                    len(hypotheses),
+                )
+                continue
+            proposals.append(proposal)
         return proposals
 
 
@@ -172,11 +195,32 @@ class Plan:
         candidates = await self._generate(
             hypotheses, concept_state, generation_width, exploration_target
         )
-        scores: list[ActionScore] = []
-        for candidate in candidates:
-            scores.append(await self._vf.score(candidate, hypotheses, concept_state))
+        # Candidates are independent of each other — scored concurrently.
+        # asyncio.gather preserves input order, so `scores` still lines
+        # up positionally with `candidates` exactly as the sequential
+        # loop did (deterministic tie-breaking in the max() below is
+        # unaffected). ValueFunction.score() no longer writes call
+        # counts to shared instance attributes (see value_function.py),
+        # which is what makes concurrent calls against one shared
+        # ValueFunction instance safe.
+        scores: list[ActionScore] = list(
+            await asyncio.gather(
+                *(self._vf.score(c, hypotheses, concept_state) for c in candidates)
+            )
+        )
         winner_score = max(scores, key=lambda s: s.total)
-        return PlanOutput(winner=winner_score.candidate, scores=scores)
+
+        # Would a different candidate win with information_value
+        # zeroed out? A pure re-max over already-computed per-term
+        # floats — no new scoring, no LLM calls.
+        winner_without_iv = max(scores, key=lambda s: s.total - s.information_value)
+        argmax_changes = winner_without_iv.candidate.id != winner_score.candidate.id
+
+        return PlanOutput(
+            winner=winner_score.candidate,
+            scores=scores,
+            argmax_changes_without_information_value=argmax_changes,
+        )
 
     async def _generate(
         self,
@@ -226,10 +270,29 @@ class Plan:
 
 
 def _target_concept(concept_state: dict) -> str | None:
+    """Default target_concept for a candidate the model didn't name
+    one for (including backfilled, no-LLM-call filler candidates) —
+    the concept the student's own message was actually grounded in
+    this turn (GroundConcept, via Diagnose), if any. Not a curriculum
+    choice: this is "what were we just talking about," not "what
+    should we teach next.\""""
     if not isinstance(concept_state, dict):
         return None
-    target = concept_state.get("target_concept")
+    target = concept_state.get("grounded_concept_id")
     return None if target is None else str(target)
+
+
+def _valid_concept_ids(concept_state: dict) -> set[str]:
+    """The current session's actual concept graph, as seen by the
+    proposer — target_concept validation (see _parse_proposals)
+    rejects anything outside this set, same discipline as
+    GroundConcept rejecting a concept_id outside the session's graph."""
+    if not isinstance(concept_state, dict):
+        return set()
+    concepts = concept_state.get("concepts")
+    if not isinstance(concepts, list):
+        return set()
+    return {c["id"] for c in concepts if isinstance(c, dict) and c.get("id")}
 
 
 def _propose_prompt(
@@ -267,6 +330,17 @@ def _propose_prompt(
             "under-examined belief, not the most likely one. Start that "
             'candidate\'s rationale with "[exploration]".\n'
         )
+    valid_concept_ids = _valid_concept_ids(concept_state)
+    concept_instruction = ""
+    if valid_concept_ids:
+        concept_instruction = (
+            "\nEach candidate's target_concept must be one of the exact "
+            "concept ids listed in concept_state.concepts above — pick "
+            "the one this turn's action actually addresses. Use null "
+            "only when no single concept in that list fits (e.g. a "
+            "purely motivational or clarifying action) — never invent "
+            "an id that isn't in that list.\n"
+        )
     return (
         "PROPOSE:ACTIONS\n"
         f"Propose exactly {width} distinct teaching actions worth scoring "
@@ -277,6 +351,7 @@ def _propose_prompt(
         f"{listing}\n"
         f"{correction}"
         f"{exploration_instruction}"
+        f"{concept_instruction}"
         'Respond with JSON: [{"action": "...", "target_concept": "..." or null, '
         '"rationale": "one short sentence"}, ...]'
     )
@@ -309,6 +384,7 @@ def _parse_proposals(
         return [], ["<response was not a JSON list>"]
 
     default_target = _target_concept(concept_state)
+    valid_concept_ids = _valid_concept_ids(concept_state)
     valid: list[CandidateAction] = []
     rejected: list[str] = []
     for item in parsed:
@@ -320,11 +396,30 @@ def _parse_proposals(
             rejected.append(repr(item.get("action")))
             continue
         target = item.get("target_concept")
+        target_concept = default_target if target is None else str(target)
+        if (
+            target is not None
+            and valid_concept_ids
+            and target_concept not in valid_concept_ids
+        ):
+            # Same validation discipline as GroundConcept: reject a
+            # concept outside this session's actual graph rather than
+            # pass it through — fall back to the grounded default
+            # instead of the hallucinated/invented id.
+            logger.warning(
+                "Plan: proposal named target_concept %r, not in this "
+                "session's %d-concept graph — rejected, falling back "
+                "to %r",
+                target_concept,
+                len(valid_concept_ids),
+                default_target,
+            )
+            target_concept = default_target
         rationale = item.get("rationale")
         valid.append(
             CandidateAction(
                 action=action,
-                target_concept=default_target if target is None else str(target),
+                target_concept=target_concept,
                 rationale=str(rationale) if rationale else "",
             )
         )
@@ -355,8 +450,44 @@ class Teach:
         # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting.
         self.last_call_count: int = 0
 
-    async def run(self, action: CandidateAction) -> str:
+    async def run(
+        self,
+        action: CandidateAction,
+        student_message: str,
+        path_requirement: PathRequirement | None = None,
+    ) -> str:
+        """Teach no longer receives the branch tree or a bare topic
+        string — a tree invites free association, a path constrains.
+        `path_requirement` (DerivePath's output, from the branch this
+        turn selected as most representative) is what scopes this
+        turn's teaching instead; None only when branch generation is
+        disabled or failed upstream, in which case this degrades to
+        target_concept-only framing, the same as before this feature
+        existed."""
         self.last_call_count = 0
+        focus = (
+            f"Focus specifically on the concept {action.target_concept!r}."
+            if action.target_concept
+            else ""
+        )
+        path_block = ""
+        if path_requirement is not None:
+            path_block = (
+                "\nWhat the student appears to currently believe: "
+                f"{path_requirement.current_belief}\n"
+                "What they need from you this turn: "
+                f"{path_requirement.needed}\n"
+                "The scope of this turn's teaching — stay within this, "
+                f"one thing, not a syllabus: {path_requirement.scope}\n"
+            )
+            if path_requirement.must_not_assume:
+                must_not = "; ".join(path_requirement.must_not_assume)
+                path_block += (
+                    "Do NOT assume or state as settled: "
+                    f"{must_not}. If the answer depends on one of these, "
+                    "address that dependency explicitly rather than "
+                    "picking a value.\n"
+                )
         prompt = (
             "TEACH: "
             + json.dumps(
@@ -364,8 +495,24 @@ class Teach:
                     "action": action.action.value,
                     "target_concept": action.target_concept,
                     "rationale": action.rationale,
+                    "student_message": student_message,
                 }
             )
+            + (f"\n{focus}" if focus else "")
+            + path_block
+            + "\nDo not introduce specific values, signs, conditions, or "
+            "givens that appear in neither the student's message nor "
+            "what you were told above.\n"
+            "Lead with the direct answer or key idea — do not open with "
+            "setup or a restatement of the question. If an example "
+            "helps, weave it into the explanation inline rather than as "
+            "a separate section. Do not partition the response into "
+            "steps or add headers unless the content genuinely requires "
+            "that structure.\n"
+            "Never mention or describe your own fields, arguments, or "
+            "internal state (e.g. never say something is \"unspecified\", "
+            "\"null\", or refer to target_concept/action/rationale by "
+            "name) — just teach, as if you already knew what to say."
         )
         result = await self._llm.complete(prompt)
         self.last_call_count += 1
@@ -602,3 +749,101 @@ class Replan:
 
     async def run(self, hypotheses: list[Hypothesis]) -> ReasoningBudget:
         return compute_reasoning_budget(hypotheses, self._config)
+
+
+class SessionMissingTopicError(Exception):
+    """Raised by SessionLoop when a turn past the first still has no
+    concept_graph_id attached — AttachTopic only ever runs on turn 0;
+    if it never succeeded (or was never attempted), every later turn
+    hard-fails here rather than silently teaching against no graph at
+    all. No retry: the session needs a fresh topic-bearing turn 0, not
+    something a later turn can fix on its own.
+    """
+
+
+def _parse_topic(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(
+            f"TOPIC:INFER response was not valid JSON: {raw!r}"
+        ) from exc
+    topic = parsed.get("topic") if isinstance(parsed, dict) else None
+    if not isinstance(topic, str) or not topic.strip():
+        raise ValueError(f"TOPIC:INFER response missing a usable topic: {raw!r}")
+    return topic.strip()
+
+
+class AttachTopic:
+    """Turn 0's topic inference: extracts a topic from the student's
+    first message, resolves it against existing concept graphs
+    (exact-match, same as `probe chat --topic`), and attaches whichever
+    graph_id results to the session — seeding a fresh one via the
+    existing `seed_graph()` when no exact match exists.
+
+    Two tiers, since this delegates two different kinds of calls:
+    `llm` (fast) for the topic extraction itself, `seed_llm` (capable)
+    only for `seed_graph()` on the seed-fresh path — same tier `probe
+    chat --topic`'s seeding already uses.
+
+    Raises (ValueError, from a malformed topic response; whatever
+    seed_graph/SeedGraphError raises on the seed-fresh path) rather
+    than fabricating a fallback topic — a nonsense topic, once
+    attached, would be stuck for the session's lifetime (set-once).
+    SessionLoop's turn-0 handling is what decides what a failure here
+    means for the turn, not this node.
+
+    Concept selection ("what to teach next") is still out of scope —
+    like GroundConcept, this only identifies a topic, not a curriculum.
+    """
+
+    def __init__(
+        self,
+        llm: LLMClient,
+        seed_llm: LLMClient,
+        concept_graph: ConceptGraph,
+        transcript: TranscriptStore,
+    ) -> None:
+        self._llm = llm
+        self._seed_llm = seed_llm
+        self._concepts = concept_graph
+        self._transcript = transcript
+        # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting:
+        # 1 for the topic-extraction call, +1 more if the seed-fresh
+        # path ran (seed_graph makes exactly one call itself).
+        self.last_call_count: int = 0
+
+    async def run(self, message: str, session_id: UUID) -> TopicAttachment:
+        self.last_call_count = 0
+        prompt = (
+            "TOPIC:INFER\n"
+            "What subject/topic is being discussed in this student "
+            "message? Respond with a short, canonical topic label (a "
+            "few words, consistent phrasing so the same subject "
+            "matches on future sessions).\n\n"
+            f"message: {message}\n"
+        )
+        raw = await self._llm.complete(prompt)
+        self.last_call_count += 1
+        topic = _parse_topic(raw)
+
+        matches = await self._concepts.find_graphs_by_topic(topic)
+        if matches:
+            # find_graphs_by_topic already orders by created_at —
+            # resume the most recently seeded graph for this topic.
+            graph_meta = matches[-1]
+            seeded_new = False
+        else:
+            concept_graph_id, _concepts = await seed_graph(
+                self._seed_llm, self._concepts, topic
+            )
+            self.last_call_count += 1
+            graph_meta = await self._concepts.get_graph(concept_graph_id)
+            assert graph_meta is not None  # just inserted, in the same call
+            seeded_new = True
+
+        await self._transcript.attach_concept_graph_id(session_id, graph_meta.id)
+
+        return TopicAttachment(
+            topic=topic, concept_graph_id=graph_meta.id, seeded_new=seeded_new
+        )

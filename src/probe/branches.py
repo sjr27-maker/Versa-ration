@@ -14,7 +14,14 @@ from uuid import UUID, uuid4
 
 import asyncpg
 
-from probe.models import Branch, BranchGenerationMeta, BranchStatus
+from probe.models import (
+    Branch,
+    BranchGenerationMeta,
+    BranchMatchRatePoint,
+    BranchStatus,
+    PathRequirement,
+    RecurringIntent,
+)
 
 
 class BranchStore:
@@ -88,6 +95,18 @@ class BranchStore:
             )
         return [self._row_to_branch(row) for row in rows]
 
+    async def list_by_generation(self, generation_id: UUID) -> list[Branch]:
+        """Every branch in one generation, any depth or status — the
+        full tree, not just its open leaves (see get_open_leaves for
+        that narrower read). For rendering the web UI's branch tree
+        panel: depth/parent_id chains, status, everything."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM branches WHERE generation_id = $1 ORDER BY depth, created_at",
+                generation_id,
+            )
+        return [self._row_to_branch(row) for row in rows]
+
     async def get_ancestors(self, branch_id: UUID) -> list[Branch]:
         """The chain from `branch_id`'s immediate parent up to the
         root, not including `branch_id` itself. Empty for a root
@@ -144,8 +163,7 @@ class BranchStore:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, session_id, turn_index, root_count, created_at
-                FROM branch_generations
+                SELECT * FROM branch_generations
                 WHERE session_id = $1
                 ORDER BY turn_index DESC, created_at DESC
                 LIMIT 1
@@ -153,6 +171,116 @@ class BranchStore:
                 session_id,
             )
         return BranchGenerationMeta(**dict(row)) if row is not None else None
+
+    async def set_selection(
+        self, generation_id: UUID, selected_branch_id: UUID | None, rationale: str
+    ) -> BranchGenerationMeta:
+        """SelectBranch's result, written onto the generation it picked
+        from. `selected_branch_id` may itself be None (nothing to
+        select from) — the rationale still records why."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE branch_generations
+                SET selected_branch_id = $2, selection_rationale = $3
+                WHERE id = $1
+                RETURNING *
+                """,
+                generation_id,
+                selected_branch_id,
+                rationale,
+            )
+        if row is None:
+            raise KeyError(f"branch_generation {generation_id} not found")
+        return BranchGenerationMeta(**dict(row))
+
+    async def set_path_requirement(
+        self, generation_id: UUID, path_requirement: PathRequirement
+    ) -> BranchGenerationMeta:
+        """DerivePath's result, written onto the same generation."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE branch_generations
+                SET path_requirement = $2
+                WHERE id = $1
+                RETURNING *
+                """,
+                generation_id,
+                path_requirement.model_dump(mode="json"),
+            )
+        if row is None:
+            raise KeyError(f"branch_generation {generation_id} not found")
+        return BranchGenerationMeta(**dict(row))
+
+    async def match_rate_by_session_for_learner(
+        self, learner_id: UUID
+    ) -> list[BranchMatchRatePoint]:
+        """Leaf-branch match rate per session, chronological — "does it
+        actually predict me" over time. Only status in
+        (matched, unmatched) counts as resolved; a session's most
+        recent, still-open generation is excluded until it resolves."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    s.id AS session_id,
+                    s.created_at AS session_created_at,
+                    count(*) FILTER (WHERE b.status IN ('matched', 'unmatched'))
+                        AS total_resolved,
+                    count(*) FILTER (WHERE b.status = 'matched') AS matched_count
+                FROM branches b
+                JOIN sessions s ON s.id = b.session_id
+                WHERE s.learner_id = $1 AND b.is_leaf = TRUE
+                GROUP BY s.id, s.created_at
+                ORDER BY s.created_at
+                """,
+                learner_id,
+            )
+        return [
+            BranchMatchRatePoint(
+                session_id=row["session_id"],
+                session_created_at=row["session_created_at"],
+                total_resolved=row["total_resolved"],
+                matched_count=row["matched_count"],
+            )
+            for row in rows
+        ]
+
+    async def recurring_root_statements_for_learner(
+        self, learner_id: UUID, limit: int = 10
+    ) -> list[RecurringIntent]:
+        """Depth-0 (intent) statements grouped by exact text across all
+        of a learner's sessions, most-recurring first — which bets
+        about this learner keep coming up, and how often they're
+        actually confirmed. `matched` propagates up from a leaf to its
+        full ancestor chain (see resolve()), so a root's own status
+        already reflects whether any descendant of it matched."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    b.statement,
+                    count(*) AS total_count,
+                    count(*) FILTER (WHERE b.status = 'matched') AS matched_count
+                FROM branches b
+                JOIN sessions s ON s.id = b.session_id
+                WHERE s.learner_id = $1 AND b.parent_id IS NULL
+                GROUP BY b.statement
+                ORDER BY total_count DESC, matched_count DESC
+                LIMIT $2
+                """,
+                learner_id,
+                limit,
+            )
+        return [
+            RecurringIntent(
+                statement=row["statement"],
+                total_count=row["total_count"],
+                matched_count=row["matched_count"],
+            )
+            for row in rows
+        ]
 
     async def _require(self, branch_id: UUID) -> Branch:
         branch = await self.get(branch_id)

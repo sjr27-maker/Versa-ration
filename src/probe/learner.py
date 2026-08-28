@@ -19,7 +19,7 @@ from uuid import UUID
 
 import asyncpg
 
-from probe.models import Learner
+from probe.models import Learner, LearnerSummary
 
 
 class LearnerStore:
@@ -67,6 +67,32 @@ class LearnerStore:
                 "SELECT * FROM learners WHERE label = $1", label
             )
         return self._row_to_learner(row) if row is not None else None
+
+    async def list_all_with_session_counts(self) -> list[LearnerSummary]:
+        """Every learner plus their session count and most recent
+        session's timestamp — for the Setup page's existing-learner
+        picker ("label, session count, and last session date")."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    l.*,
+                    count(s.id) AS session_count,
+                    max(s.created_at) AS last_session_at
+                FROM learners l
+                LEFT JOIN sessions s ON s.learner_id = l.id
+                GROUP BY l.id
+                ORDER BY last_session_at DESC NULLS LAST, l.created_at DESC
+                """
+            )
+        return [
+            LearnerSummary(
+                learner=self._row_to_learner(row),
+                session_count=row["session_count"],
+                last_session_at=row["last_session_at"],
+            )
+            for row in rows
+        ]
 
     def _row_to_learner(self, row) -> Learner:
         return Learner(
