@@ -43,6 +43,51 @@ async def test_record_and_get_for_turn_roundtrips(
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_every_field_roundtrips_write_to_read(
+    transcript, clean_pool, learner_id, concept_graph_id
+):
+    """Generic, future-proofing regression test — not an explicit
+    per-field assertion list (which would itself need to be remembered
+    and updated every time a field is added, the exact same class of
+    mistake this guards against). Every field is set to a value that
+    differs from its own default (True instead of False, a real float
+    instead of None, non-empty collections instead of empty ones), then
+    the fetched object's full model_dump() is compared against the
+    original's. If a future migration adds a column without updating
+    both the TurnDiagnostics model AND TurnDiagnosticsStore's
+    INSERT/_row_to_diagnostics, that field silently reverts to its
+    default on read (or the model doesn't have it at all — an
+    immediate, loud crash) — either way this test fails instead of the
+    gap surfacing later as a webui AttributeError.
+    """
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    store = TurnDiagnosticsStore(clean_pool)
+
+    diagnostics = TurnDiagnostics(
+        session_id=session_id,
+        turn_index=0,
+        node_call_counts={"Diagnose": 1, "Teach": 2},
+        total_call_count=17,
+        guardrail_fired=True,
+        entropy_bits=2.75,
+        duration_ms=456.7,
+        warnings=["warning one", "warning two"],
+        teach_failed=True,
+        inferred_topic="Derivatives",
+        topic_seeded_new=True,
+        retry_count=3,
+        options_missed=True,
+        current_belief_unsupported=True,
+    )
+    await store.record(diagnostics)
+
+    fetched = await store.get_for_turn(session_id, 0)
+
+    assert fetched is not None
+    assert fetched.model_dump() == diagnostics.model_dump()
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_retry_count_defaults_to_zero_when_not_specified(
     transcript, clean_pool, learner_id, concept_graph_id
 ):

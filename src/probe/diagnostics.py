@@ -18,6 +18,7 @@ from uuid import UUID
 import asyncpg
 
 from probe.models import TurnDiagnostics
+from probe.row_mapping import assert_row_consumed
 
 
 class TurnDiagnosticsStore:
@@ -75,21 +76,6 @@ class TurnDiagnosticsStore:
         return [self._row_to_diagnostics(row) for row in rows]
 
     def _row_to_diagnostics(self, row) -> TurnDiagnostics:
-        return TurnDiagnostics(
-            id=row["id"],
-            session_id=row["session_id"],
-            turn_index=row["turn_index"],
-            node_call_counts=row["node_call_counts"],
-            total_call_count=row["total_call_count"],
-            guardrail_fired=row["guardrail_fired"],
-            entropy_bits=row["entropy_bits"],
-            duration_ms=row["duration_ms"],
-            warnings=row["warnings"],
-            teach_failed=row["teach_failed"],
-            inferred_topic=row["inferred_topic"],
-            topic_seeded_new=row["topic_seeded_new"],
-            retry_count=row["retry_count"],
-            options_missed=row["options_missed"],
-            current_belief_unsupported=row["current_belief_unsupported"],
-            created_at=row["created_at"],
-        )
+        mapped = dict(row)
+        assert_row_consumed(TurnDiagnostics, mapped)
+        return TurnDiagnostics(**mapped)

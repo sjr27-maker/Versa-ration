@@ -232,6 +232,51 @@ async def test_set_path_requirement_persists_and_roundtrips(
     assert refetched.path_requirement.must_not_assume == ["the function is linear"]
 
 
+@pytest.mark.asyncio(loop_scope="session")
+async def test_every_field_roundtrips_write_to_read(
+    branch_store, transcript, clean_pool, learner_id, concept_graph_id
+):
+    """Generic, future-proofing regression test — every field set to a
+    non-default value, then the fetched object's full model_dump() is
+    compared against the original's, same pattern as
+    test_diagnostics_store.py's equivalent test. If a future migration
+    adds a column without updating both Branch and
+    BranchStore._row_to_branch, this fails loudly (assert_row_consumed
+    raising) instead of the column silently vanishing on read.
+    """
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    generation = await branch_store.create_generation(session_id, 0, root_count=1)
+    root = Branch(
+        parent_id=None, generation_id=generation.id, session_id=session_id,
+        turn_index=0, depth=0, depth_label="intent", statement="root",
+        predicted_next_turn="p0", plausibility=0.6, is_leaf=False,
+    )
+    await branch_store.add_branches([root])
+
+    branch = Branch(
+        parent_id=root.id,
+        generation_id=generation.id,
+        session_id=session_id,
+        turn_index=2,
+        depth=3,
+        depth_label="predicted_action",
+        statement="every field set to a non-default value",
+        predicted_next_turn="will ask a specific follow-up",
+        requires_evidence="the student confirms they want the derivation",
+        evidence_satisfied=True,
+        plausibility=0.42,
+        is_leaf=True,
+        status=BranchStatus.MATCHED,
+        matched_via="option_click",
+    )
+    await branch_store.add_branches([branch])
+
+    fetched = await branch_store.get(branch.id)
+
+    assert fetched is not None
+    assert fetched.model_dump() == branch.model_dump()
+
+
 def test_branches_module_has_no_delete():
     """The branch store must be append-only. See CLAUDE.md invariant 6.
 

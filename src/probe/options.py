@@ -14,6 +14,7 @@ from uuid import UUID
 import asyncpg
 
 from probe.models import Option, OptionStatus
+from probe.row_mapping import assert_row_consumed
 
 
 class OptionStore:
@@ -89,13 +90,6 @@ class OptionStore:
         return option
 
     def _row_to_option(self, row) -> Option:
-        return Option(
-            id=row["id"],
-            branch_id=row["branch_id"],
-            generation_id=row["generation_id"],
-            session_id=row["session_id"],
-            turn_index=row["turn_index"],
-            text=row["text"],
-            status=OptionStatus(row["status"]),
-            created_at=row["created_at"],
-        )
+        mapped = dict(row)
+        assert_row_consumed(Option, mapped)
+        return Option(**mapped)

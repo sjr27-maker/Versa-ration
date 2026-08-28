@@ -12,6 +12,7 @@ from probe.models import (
     Polarity,
     Tier,
 )
+from probe.row_mapping import assert_row_consumed
 
 
 class HypothesisStore:
@@ -342,16 +343,12 @@ class HypothesisStore:
                 """,
                 hypothesis_id,
             )
-        return [
-            HypothesisTierChange(
-                id=row["id"],
-                hypothesis_id=row["hypothesis_id"],
-                old_tier=Tier(row["old_tier"]),
-                new_tier=Tier(row["new_tier"]),
-                changed_at=row["changed_at"],
-            )
-            for row in rows
-        ]
+        return [self._row_to_tier_change(row) for row in rows]
+
+    def _row_to_tier_change(self, row) -> HypothesisTierChange:
+        mapped = dict(row)
+        assert_row_consumed(HypothesisTierChange, mapped)
+        return HypothesisTierChange(**mapped)
 
     async def _insert_evidence(
         self,
@@ -383,18 +380,28 @@ class HypothesisStore:
             raise KeyError(f"hypothesis {id} not found")
         return hyp
 
+    def _row_to_evidence_ref(self, row) -> EvidenceRef:
+        mapped = dict(row)
+        # hypothesis_id is the FK this row was fetched by — it isn't
+        # part of EvidenceRef itself (the owning Hypothesis already
+        # knows its own id), so it's explicitly dropped rather than
+        # left to be silently ignored by assert_row_consumed's check.
+        mapped.pop("hypothesis_id")
+        # created_at (DB-insert timestamp, defaulted by NOW() since
+        # migration 001) has never been part of EvidenceRef and has
+        # never been read anywhere — distinct from `timestamp` (the
+        # evidence's own logical time, set by the caller). Confirmed
+        # pre-existing, not introduced by this conversion; flagged to
+        # the user rather than silently modeled or silently dropped.
+        mapped.pop("created_at")
+        assert_row_consumed(EvidenceRef, mapped)
+        return EvidenceRef(**mapped)
+
     def _row_to_hypothesis(self, row, ev_rows) -> Hypothesis:
         supporting: list[EvidenceRef] = []
         contradicting: list[EvidenceRef] = []
         for ev in ev_rows:
-            ref = EvidenceRef(
-                id=ev["id"],
-                turn_id=ev["turn_id"],
-                polarity=Polarity(ev["polarity"]),
-                timestamp=ev["timestamp"],
-                resulting_probability=ev["resulting_probability"],
-                resulting_confidence=ev["resulting_confidence"],
-            )
+            ref = self._row_to_evidence_ref(ev)
             if ref.polarity is Polarity.SUPPORTING:
                 supporting.append(ref)
             else:

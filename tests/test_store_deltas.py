@@ -133,3 +133,71 @@ async def test_list_tier_changes_is_empty_for_a_hypothesis_never_retiered(store)
         )
     )
     assert await store.list_tier_changes(hyp.id) == []
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_evidence_ref_every_field_roundtrips_write_to_read(
+    store, transcript, learner_id, concept_graph_id
+):
+    """Generic, future-proofing regression test for EvidenceRef, same
+    pattern as test_diagnostics_store.py's equivalent test — every
+    field set to a non-default value, full model_dump() comparison.
+    Goes through reweight() (not add()) since that's the only path
+    that populates resulting_probability/resulting_confidence, the two
+    fields most likely to be the ones a future change forgets to wire
+    up on read.
+    """
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    turn_id = await transcript.record_turn(session_id, 0, "a turn")
+
+    hyp = await store.add(
+        Hypothesis(
+            layer=Layer.KNOWLEDGE,
+            statement="stub",
+            probability=0.3,
+            confidence=0.3,
+            tier=Tier.ACTIVE,
+        )
+    )
+    evidence_ref = EvidenceRef(turn_id=turn_id, polarity=Polarity.CONTRADICTING)
+    await store.reweight(hyp.id, 0.75, 0.65, evidence_ref)
+
+    fetched = await store.get(hyp.id)
+    new_ref = fetched.counter_evidence_refs[-1]
+
+    expected = evidence_ref.model_dump()
+    expected["resulting_probability"] = pytest.approx(0.75)
+    expected["resulting_confidence"] = pytest.approx(0.65)
+    assert new_ref.model_dump() == expected
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_hypothesis_tier_change_every_field_roundtrips_write_to_read(store):
+    """Generic, future-proofing regression test for
+    HypothesisTierChange, same pattern as
+    test_diagnostics_store.py's equivalent test."""
+    hyp = await store.add(
+        Hypothesis(
+            layer=Layer.KNOWLEDGE,
+            statement="stub",
+            probability=0.5,
+            confidence=0.5,
+            tier=Tier.DORMANT,
+        )
+    )
+    await store.retier(hyp.id, Tier.ACTIVE)
+
+    changes = await store.list_tier_changes(hyp.id)
+
+    assert len(changes) == 1
+    fetched = changes[0]
+    assert fetched.hypothesis_id == hyp.id
+    assert fetched.old_tier is Tier.DORMANT
+    assert fetched.new_tier is Tier.ACTIVE
+    assert fetched.model_dump() == {
+        "id": fetched.id,
+        "hypothesis_id": hyp.id,
+        "old_tier": Tier.DORMANT,
+        "new_tier": Tier.ACTIVE,
+        "changed_at": fetched.changed_at,
+    }

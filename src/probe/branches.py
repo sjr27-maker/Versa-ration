@@ -22,6 +22,7 @@ from probe.models import (
     PathRequirement,
     RecurringIntent,
 )
+from probe.row_mapping import assert_row_consumed
 
 
 class BranchStore:
@@ -44,7 +45,7 @@ class BranchStore:
                 turn_index,
                 root_count,
             )
-        return BranchGenerationMeta(**dict(row))
+        return self._row_to_generation_meta(row)
 
     async def add_branches(self, branches: list[Branch]) -> list[Branch]:
         if not branches:
@@ -227,7 +228,7 @@ class BranchStore:
                 """,
                 session_id,
             )
-        return BranchGenerationMeta(**dict(row)) if row is not None else None
+        return self._row_to_generation_meta(row) if row is not None else None
 
     async def set_selection(
         self, generation_id: UUID, selected_branch_id: UUID | None, rationale: str
@@ -249,7 +250,7 @@ class BranchStore:
             )
         if row is None:
             raise KeyError(f"branch_generation {generation_id} not found")
-        return BranchGenerationMeta(**dict(row))
+        return self._row_to_generation_meta(row)
 
     async def set_path_requirement(
         self, generation_id: UUID, path_requirement: PathRequirement
@@ -268,7 +269,7 @@ class BranchStore:
             )
         if row is None:
             raise KeyError(f"branch_generation {generation_id} not found")
-        return BranchGenerationMeta(**dict(row))
+        return self._row_to_generation_meta(row)
 
     async def match_rate_by_session_for_learner(
         self, learner_id: UUID
@@ -376,21 +377,11 @@ class BranchStore:
         return branch
 
     def _row_to_branch(self, row) -> Branch:
-        return Branch(
-            id=row["id"],
-            parent_id=row["parent_id"],
-            generation_id=row["generation_id"],
-            session_id=row["session_id"],
-            turn_index=row["turn_index"],
-            depth=row["depth"],
-            depth_label=row["depth_label"],
-            statement=row["statement"],
-            predicted_next_turn=row["predicted_next_turn"],
-            requires_evidence=row["requires_evidence"],
-            evidence_satisfied=row["evidence_satisfied"],
-            plausibility=row["plausibility"],
-            is_leaf=row["is_leaf"],
-            status=BranchStatus(row["status"]),
-            matched_via=row["matched_via"],
-            created_at=row["created_at"],
-        )
+        mapped = dict(row)
+        assert_row_consumed(Branch, mapped)
+        return Branch(**mapped)
+
+    def _row_to_generation_meta(self, row) -> BranchGenerationMeta:
+        mapped = dict(row)
+        assert_row_consumed(BranchGenerationMeta, mapped)
+        return BranchGenerationMeta(**mapped)

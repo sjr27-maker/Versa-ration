@@ -135,6 +135,35 @@ async def test_get_returns_none_for_unknown_id(option_store):
     assert await option_store.get(uuid4()) is None
 
 
+@pytest.mark.asyncio(loop_scope="session")
+async def test_every_field_roundtrips_write_to_read(
+    branch_store, option_store, transcript, clean_pool, learner_id, concept_graph_id
+):
+    """Generic, future-proofing regression test — every field set to a
+    non-default value, full model_dump() comparison, same pattern as
+    test_diagnostics_store.py's equivalent test. If a future migration
+    adds a column without updating both Option and
+    OptionStore._row_to_option, this fails loudly instead of the
+    column silently vanishing on read.
+    """
+    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    generation, branch = await _make_generation_and_branch(branch_store, session_id)
+    option = Option(
+        branch_id=branch.id,
+        generation_id=generation.id,
+        session_id=session_id,
+        turn_index=3,
+        text="every field set to a non-default value",
+        status=OptionStatus.SELECTED,
+    )
+    await option_store.create_options([option])
+
+    fetched = await option_store.get(option.id)
+
+    assert fetched is not None
+    assert fetched.model_dump() == option.model_dump()
+
+
 def test_options_module_has_no_delete():
     """The options store must be append-only. See CLAUDE.md invariant 8.
 
