@@ -157,20 +157,22 @@ async def test_teach_failure_still_generates_and_keeps_the_branch_tree(
         revision_store, llm, diagnostics_store, branch_store=branch_store,
     )
 
-    await loop.handle_turn(session_id, 0, "a turn")
+    await loop.handle_turn(session_id, 0, "warmup turn")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "a turn")
 
     async with clean_pool.acquire() as conn:
         names = {
             r["node_name"]
             for r in await conn.fetch(
-                "SELECT node_name FROM node_calls WHERE session_id=$1", session_id
+                "SELECT node_name FROM node_calls WHERE session_id=$1 AND turn_index=1",
+                session_id,
             )
         }
     assert "BranchGenerate" in names
     generation = await branch_store.get_latest_generation(session_id)
     assert generation is not None
 
-    diagnostics = await diagnostics_store.get_for_turn(session_id, 0)
+    diagnostics = await diagnostics_store.get_for_turn(session_id, 1)
     assert diagnostics.teach_failed is True
     assert any(
         "BranchGenerate ran before Teach failed" in w for w in diagnostics.warnings
@@ -182,29 +184,31 @@ async def test_branch_resolve_failure_leaves_the_prior_generations_branches_unto
     store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
     concept_graph, learner_overlay, revision_store, diagnostics_store, branch_store,
 ):
-    """Turn 1 still runs its own (successful) BranchGenerate regardless
-    of whether turn 1's BranchResolve failed, so _prior_generation_id
-    legitimately ends up pointing at turn 1's new generation either
+    """Turn 2 still runs its own (successful) BranchGenerate regardless
+    of whether turn 2's BranchResolve failed, so _prior_generation_id
+    legitimately ends up pointing at turn 2's new generation either
     way — that's not what a failed resolve should be judged on. What
     actually matters: resolve() never got to run its status-mutation
-    logic, so turn 0's branches must still be exactly as open as they
-    were, not silently (and wrongly) marked matched/unmatched."""
+    logic, so turn 1's branches (turn 0 never generates at all — see
+    loop.py) must still be exactly as open as they were, not silently
+    (and wrongly) marked matched/unmatched."""
     loop = _make_loop(
         store, transcript, node_calls, concept_graph, learner_overlay,
         revision_store, StubLLMClient(), diagnostics_store, branch_store=branch_store,
     )
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "first turn")
-    turn_0_generation = await branch_store.get_latest_generation(session_id)
-    assert turn_0_generation is not None
-    leaves_before = await branch_store.get_open_leaves(turn_0_generation.id)
+    await loop.handle_turn(session_id, 0, "warmup turn")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "first turn")
+    turn_1_generation = await branch_store.get_latest_generation(session_id)
+    assert turn_1_generation is not None
+    leaves_before = await branch_store.get_open_leaves(turn_1_generation.id)
     assert leaves_before  # something exists to (fail to) resolve
 
     loop.branch_resolve.run = _raise_async_factory()
-    await loop.handle_turn(session_id, 1, "second turn")
+    await loop.handle_turn(session_id, 2, "second turn")
 
-    leaves_after = await branch_store.get_open_leaves(turn_0_generation.id)
+    leaves_after = await branch_store.get_open_leaves(turn_1_generation.id)
     assert {b.id for b in leaves_after} == {b.id for b in leaves_before}
 
 

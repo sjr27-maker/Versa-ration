@@ -14,6 +14,21 @@ creation, not threaded through as separate per-turn state).
 All node invocations flow through `_call_node`, which records inputs
 and outputs to node_calls per CLAUDE.md invariant 2.
 
+Infer's output (`InferOutput`) carries two kinds of proposal, not one:
+`reweights` for hypotheses already in the store, and `creates` for
+beliefs this turn suggests that nothing yet covers. Before this fix,
+Infer could only reweight — `HypothesisStore.reweight()` raises on a
+missing id, so a fresh learner's hypothesis list stayed permanently
+empty, `compute_reasoning_budget([])` always saw `entropy_bits=0.0`,
+and generation_width/run_information_value/exploration_target were all
+silently pinned at their zero-entropy floor in every real session ever
+run (see Infer's own docstring in nodes.py for the full trace). Update
+now calls `HypothesisStore.add()` for `creates`, starting each new
+hypothesis at `Tier.ACTIVE` specifically so it's visible to this same
+turn's `refreshed_hypotheses` read (right after Update, below) and
+therefore to this same turn's Replan/Plan/BranchGenerate calls — not
+just to next turn's.
+
 Replan runs at the end of each turn and returns a `ReasoningBudget`
 (reasoning_budget.py — the single source of truth for the entropy ->
 behavior mapping) computed from the just-updated hypothesis
@@ -74,6 +89,26 @@ click nor typed text satisfies anything that was on offer,
 student was uncooperative" — and fed into the next turn's generation
 context.
 
+Turn 0 skips branch generation entirely: `BranchGenerate` (and
+everything that consumes its output — `SelectBranch`, `DerivePath`,
+`GenerateOptions`) does not run when `turn_index == 0`. A tree
+generated from a single opening message, before any accumulated
+evidence exists, is unspecific by construction and costs a full
+generation's worth of calls for nothing worth matching against later.
+Turn 0 therefore runs the short chain — Diagnose -> Infer -> Update ->
+Replan -> Plan -> Teach — with `self._prior_generation_id` left at its
+initial `None`, so turn 1's `BranchResolve` guard (`self.branch_resolve
+is not None and self._prior_generation_id is not None`) sees "no prior
+generation" exactly as if none had ever existed, rather than resolving
+against a hole. Teach on turn 0 explicitly receives
+`path_requirement=None` and `options=[]` as a result, the same
+target_concept-only framing it used before HypothesisGenerator existed
+— still a direct, grounded answer to what the student asked, just
+without a derived path to scope it further. The skip (and why) is
+recorded on that turn's `turn_diagnostics.generation_skipped_reason`,
+so a turn with no branches because none were needed yet is
+distinguishable from a turn where generation ran and failed.
+
 Topic inference (`AttachTopic`, nodes.py) replaces `--topic`: a
 session may be created with `concept_graph_id=None` (migration 013),
 and its first turn (`turn_index == 0`) runs `AttachTopic` against the
@@ -101,6 +136,78 @@ via `diagnostics_store` (`None` skips recording, same backward-
 compatible pattern as `branch_store`) — the persisted form of
 everything this module already computes each turn, so the web UI's
 Diagnostics panel reads it directly instead of re-deriving anything.
+
+`ablation_config` (ablation.py, default `AblationConfig()` — every
+subsystem on, identical to omitting it entirely) is the single
+switchboard for which of the above actually run this session:
+`enable_portrait` gates the hypothesis reads/Infer/Update block;
+`enable_concept_graph` gates the whole topic-inference block
+(including the turn-past-0 hard-fail, deliberately bypassed when this
+is off) and is threaded into Diagnose as `enable_grounding`;
+`enable_diagnose` threads into Diagnose as `enable_mismatch`;
+`enable_planner` gates the Plan call itself, substituting a fixed,
+no-LLM-call `CandidateAction` when off; `enable_branches`/
+`enable_options` extend the existing `branch_store`/`option_store`
+opt-in (a store can be supplied and still not be used, if ablated off);
+`enable_exploration_slot` forces `exploration_target` to `None`
+regardless of what Replan computed; `reasoning_budget_mode` pins
+`generation_width` to `fixed_generation_width` instead of scaling with
+entropy. When every major subsystem is off (`AblationConfig.
+is_full_bypass`), `handle_turn` takes a completely different path
+(`_handle_bypass_turn`) rather than reaching the same state through
+every individual guard — the true plain-LLM baseline every ablated
+configuration is measured against, and the harness's own overhead must
+not leak into that number.
+
+`ExtractRequest` (nodes.py) runs every turn, right before Plan: does
+the student's message contain a concrete, answerable request (a
+specific function, problem, example, or question with a definite
+thing to produce)? When it does, that `ExplicitRequest` takes
+precedence over Plan's chosen target_concept and DerivePath's scope —
+threaded into Plan's proposer prompt, structurally enforced into
+DerivePath's `scope` (not just asked for in its prompt — see
+`hypothesis_generator._enforce_explicit_request_scope`), and stated to
+Teach as a separate must-answer instruction from `path_requirement`.
+The pedagogical machinery decides HOW to teach, never WHETHER to
+answer what was actually asked. `check_explicit_request_unaddressed`
+is the post-Teach backstop for when that precedence gets lost anyway
+(Plan substitutes a different example, Teach defers to "next turn")
+— a heuristic flag on `turn_diagnostics`, same spirit as
+`current_belief_unsupported`, not proof of a failure.
+
+Teach's working memory: `_build_teach_history` gives Teach a compact,
+small-N block (`_TEACH_HISTORY_TURNS`) of the last few student turns
+paired with Teach's own responses to them, read back out of
+node_calls rather than a second persistence path — invariant 2 already
+guarantees Teach's rendered output is durable. Deliberately not
+`_build_transcript_context` (HypothesisGenerator's full session
+history): this exists only so Teach notices its own recent work
+instead of contradicting or ignoring it. `_build_examples_used`
+separately tracks concrete examples/analogies used this session,
+backed by a new node, `ExtractTeachingArtifact` (nodes.py), which runs
+once right after Teach succeeds and pulls a short structured
+`TeachingArtifact` (example, analogy) out of that turn's rendered
+text — cheaper and more reliable for "was this already used" than
+re-reading full prose every turn. Both blocks feed into Teach's prompt
+so it can reuse or build on an established example/analogy instead of
+reaching for a new one, and so that when the student references
+something from earlier ("the example you just gave"), Teach is told to
+name and use that specific thing rather than restating generically or
+replacing it with a new framing. `check_prior_reference_unaddressed` is
+the post-Teach backstop for when that gets lost anyway — same
+heuristic-flag spirit as `check_explicit_request_unaddressed`, gated on
+`detect_prior_reference` finding backward-pointing language in the
+student's message and checked only against the immediately preceding
+turn's tracked artifact, since "you just gave" cannot mean anything
+further back.
+
+`ablation_config.reasoning_mode = ReasoningMode.DISAMBIGUATE` routes a
+turn to `_handle_disambiguation_turn` instead of any of the above —
+see disambiguate.py's module docstring for that mode's own, much
+shallower flow (AssessAndBranch -> [DisambiguationOptions] ->
+FinalAnswer, at most three LLM calls per exchange). This is checked
+before `is_full_bypass`: it is a wholly separate architecture, not one
+more thing every `enable_*` flag can turn on or off.
 """
 
 from __future__ import annotations
@@ -112,10 +219,18 @@ from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
+from probe.ablation import AblationConfig, ReasoningBudgetMode, ReasoningMode
 from probe.audit import NodeCallStore, TranscriptStore
 from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph
 from probe.diagnostics import TurnDiagnosticsStore
+from probe.disambiguate import (
+    AssessAndBranch,
+    DisambiguationOptions,
+    DisambiguationStore,
+    FinalAnswer,
+    build_typed_past_note,
+)
 from probe.grounding import GroundConcept
 from probe.hypothesis_generator import (
     BranchGenerate,
@@ -131,18 +246,27 @@ from probe.hypothesis_generator import (
 from probe.llm import LLMClient, ModelTierClients
 from probe.mismatch import MismatchDetector
 from probe.models import (
+    BranchStatus,
     CandidateAction,
+    DisambiguationAssessment,
+    DisambiguationBranch,
+    ExplicitRequest,
+    InferOutput,
     Option,
     OptionStatus,
     PlanOutput,
     TeachingAction,
+    TeachingArtifact,
     TurnDiagnostics,
 )
 from probe.nodes import (
     DEFAULT_GENERATION_WIDTH,
     MAX_CALLS_PER_TURN,
     AttachTopic,
+    BaselineTeach,
     Diagnose,
+    ExtractRequest,
+    ExtractTeachingArtifact,
     Infer,
     Plan,
     Replan,
@@ -150,6 +274,9 @@ from probe.nodes import (
     Teach,
     Test,
     Update,
+    check_explicit_request_unaddressed,
+    check_prior_reference_unaddressed,
+    detect_prior_reference,
 )
 from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
@@ -180,6 +307,26 @@ _PLAN_FALLBACK_ACTION = TeachingAction.EXPLAIN
 _TEACH_FAILURE_MESSAGE = (
     "the tutor failed to respond this turn — see Diagnostics for the "
     "error; try sending your message again"
+)
+
+# Teach's compact recent-history input (item 1 of the "working memory"
+# fix) — deliberately small, and deliberately NOT the full
+# transcript_context HypothesisGenerator uses: this exists only so
+# Teach notices its own last few turns, not to re-derive the whole
+# session.
+_TEACH_HISTORY_TURNS = 3
+
+# Cap on how many past ExtractTeachingArtifact calls _build_examples_used
+# reads back — bounds a very long session's prompt size. Generous on
+# purpose: an analogy from several turns ago can still be worth reusing,
+# so this isn't "only recent ones matter" the way _TEACH_HISTORY_TURNS is.
+_MAX_TRACKED_ARTIFACTS = 20
+
+# turn_diagnostics.generation_skipped_reason on turn 0 — see module
+# docstring for why turn 0 never runs BranchGenerate at all.
+_TURN_ZERO_GENERATION_SKIP_REASON = (
+    "turn 0 has no accumulated evidence yet — a tree generated from a "
+    "single opening message is unspecific by construction"
 )
 
 # Diagnose's own "nothing grounded / nothing to say" shape (see
@@ -240,6 +387,8 @@ class SessionLoop:
         diagnostics_store: TurnDiagnosticsStore | None = None,
         option_store: OptionStore | None = None,
         on_node_start: Callable[[str], None] | None = None,
+        ablation_config: AblationConfig | None = None,
+        disambiguation_store: DisambiguationStore | None = None,
     ) -> None:
         # Tiering (fast/capable/best -> real Gemini models, see
         # model_config.py) is opt-in via model_tier_clients. Omitting it
@@ -257,26 +406,67 @@ class SessionLoop:
         self._learner_overlay = learner_overlay
         self._diagnostics = diagnostics_store
         self._on_node_start = on_node_start
+        self._ablation = ablation_config or AblationConfig()
+
+        # value_function_config precedence: an explicit ablation_config
+        # always wins (its nested `value_function` field IS the value
+        # function config for that session — see AblationConfig's
+        # docstring, "reuse verbatim rather than duplicated"); otherwise
+        # fall back to the standalone value_function_config param exactly
+        # as before, so every existing caller/test that passes it without
+        # ablation_config keeps getting exactly what it passed.
+        effective_value_function_config = (
+            ablation_config.value_function
+            if ablation_config is not None
+            else (value_function_config or ValueFunctionConfig())
+        )
         # Kept separately from self.value_function.config so the
         # per-turn run_information_value toggle can be ANDed against
         # the caller's original intent instead of overwriting it —
         # ValueFunctionConfig is mutated in place turn to turn (see
         # handle_turn), so the original has to be remembered elsewhere.
         self._base_enable_information_value = (
-            value_function_config.enable_information_value
-            if value_function_config is not None
-            else True
+            effective_value_function_config.enable_information_value
         )
         # Tier assignment: fast -> Infer, GroundConcept, MismatchDetector,
         # ValueFunction terms, AttachTopic's topic extraction; capable ->
         # Plan's proposer, AttachTopic's seed_graph delegation; best -> Teach.
-        self.value_function = ValueFunction(tiers.fast, value_function_config)
+        self.value_function = ValueFunction(tiers.fast, effective_value_function_config)
         self.infer = Infer(tiers.fast)
+        # Fast tier, same reasoning as GroundConcept/MismatchDetector:
+        # fires every turn, and only needs to read the raw student
+        # message, not reason deeply about it.
+        self.extract_request = ExtractRequest(tiers.fast)
         self.plan = Plan(self.value_function, tiers.capable)
         self.teach = Teach(tiers.best)
+        # Fast tier, same reasoning as ExtractRequest: runs once, right
+        # after Teach succeeds, to pull a structured example/analogy
+        # signal out of Teach's own rendered text — see
+        # _build_examples_used/_build_teach_history below.
+        self.extract_teaching_artifact = ExtractTeachingArtifact(tiers.fast)
+        # The true plain-LLM baseline (AblationConfig.is_full_bypass) —
+        # same tier as Teach, since that's what it's being compared
+        # against. Cheap to construct unconditionally (no store
+        # dependency at all), so there's no reason to gate it behind
+        # is_full_bypass the way the branch nodes are gated behind
+        # branch_store.
+        self.baseline_teach = BaselineTeach(tiers.best)
         self.test = Test()
         self.update = Update()
-        self.replan = Replan(reasoning_budget_config)
+        # enable_exploration_slot=False also zeroes the width floor that
+        # would otherwise still reserve a slot for it (see
+        # ReasoningBudgetConfig.min_exploration_slots) — handle_turn's
+        # own exploration_target=None override (below) is the primary
+        # enforcement; this is what keeps generation_width itself
+        # accurate too, so a disabled exploration slot doesn't leave an
+        # extra scored candidate as a cost artifact of the mechanism
+        # it's supposed to remove.
+        base_reasoning_budget_config = reasoning_budget_config or ReasoningBudgetConfig()
+        if not self._ablation.enable_exploration_slot:
+            base_reasoning_budget_config = base_reasoning_budget_config.model_copy(
+                update={"min_exploration_slots": 0}
+            )
+        self.replan = Replan(base_reasoning_budget_config)
         self.diagnose = Diagnose(
             mismatch_detector=MismatchDetector(tiers.fast),
             ground_concept=GroundConcept(tiers.fast),
@@ -304,10 +494,19 @@ class SessionLoop:
         # exact pre-existing turn flow — generate()/resolve() are simply
         # never called. Tier: fast, same reasoning as GroundConcept/
         # MismatchDetector (fires every turn, multiplies fast).
+        #
+        # AblationConfig.enable_branches is ANDed onto the same
+        # branch_store-is-not-None check rather than requiring the
+        # caller to withhold branch_store when ablating it off — a
+        # caller can always pass every store it has and let
+        # ablation_config alone decide what actually gets used, the
+        # same way a caller doesn't need to omit hypothesis_store to
+        # get enable_portrait=False's behavior.
         self._branch_store = branch_store
         self._options_store = option_store
         self._prior_generation_id = None
-        if branch_store is not None:
+        branches_active = branch_store is not None and self._ablation.enable_branches
+        if branches_active:
             self._hypothesis_generator = HypothesisGenerator(
                 tiers.fast, branch_store, branch_budget_config, option_store
             )
@@ -330,13 +529,39 @@ class SessionLoop:
         # option_store without branch_store does nothing. option_store
         # alone (branch_store also set) is what "both channels stay
         # enabled" means — the click path and the typed-evidence-check
-        # path both route through this pair.
-        if branch_store is not None and option_store is not None:
+        # path both route through this pair. AblationConfig's own
+        # validator already guarantees enable_options implies
+        # enable_branches, so branches_active is the correct additional
+        # gate here (not just self._ablation.enable_options alone).
+        if branches_active and option_store is not None and self._ablation.enable_options:
             self.generate_options: GenerateOptions | None = GenerateOptions(tiers.fast)
             self.check_evidence: CheckEvidence | None = CheckEvidence(tiers.fast)
         else:
             self.generate_options = None
             self.check_evidence = None
+
+        # disambiguate.py's minimal three-call mode (ReasoningMode.
+        # DISAMBIGUATE) — a wholly separate architecture from
+        # everything above, not one more ablatable piece of it (see
+        # ReasoningMode's docstring). Constructed unconditionally
+        # (cheap: no store dependency beyond disambiguation_store
+        # itself) the same way BaselineTeach is always constructed
+        # regardless of is_full_bypass — the mode selection lives on
+        # `ablation_config`, not on whether these attributes exist.
+        # Fast tier for the two judgment calls, same reasoning as
+        # ExtractRequest/GenerateOptions; best tier for FinalAnswer,
+        # since it is the response the student actually sees, same as
+        # Teach/BaselineTeach.
+        self._disambiguation = disambiguation_store
+        self.assess_and_branch = AssessAndBranch(tiers.fast)
+        self.disambiguation_options = DisambiguationOptions(tiers.fast)
+        self.final_answer = FinalAnswer(tiers.best)
+        # The most recent AssessAndBranch-generating turn's id, if its
+        # branches are still unresolved — mirrors self._prior_generation_id's
+        # role for the tree-based system. None whenever the last
+        # disambiguation turn was a click resolution, a direct answer,
+        # or has already been superseded by a later typed-past turn.
+        self._prior_disambiguation_turn_id: UUID | None = None
 
     async def run_interactive(
         self, learner_id: UUID, concept_graph_id: UUID | None
@@ -369,6 +594,21 @@ class SessionLoop:
         turn_text: str,
         selected_option_id: UUID | None = None,
     ) -> str:
+        if self._ablation.reasoning_mode is ReasoningMode.DISAMBIGUATE:
+            # A wholly separate architecture, checked first: none of
+            # the enable_* flags below are consulted at all in this
+            # mode (see ReasoningMode.DISAMBIGUATE's docstring and
+            # disambiguate.py's module docstring).
+            return await self._handle_disambiguation_turn(
+                session_id, turn_index, turn_text, selected_option_id
+            )
+
+        if self._ablation.is_full_bypass:
+            # Genuine bypass, not every individual guard below happening
+            # to no-op at once: see _handle_bypass_turn and this
+            # module's docstring.
+            return await self._handle_bypass_turn(session_id, turn_index, turn_text)
+
         start = time.monotonic()
         retry_count_start = _total_retry_count(self._tiers)
         warnings: list[str] = []
@@ -482,7 +722,7 @@ class SessionLoop:
         inferred_topic: str | None = None
         topic_seeded_new: bool | None = None
         current_graph_id = await self._transcript.get_concept_graph_id(session_id)
-        if current_graph_id is None:
+        if self._ablation.enable_concept_graph and current_graph_id is None:
             if turn_index == 0:
                 try:
                     attachment = await self._call_node(
@@ -518,6 +758,12 @@ class SessionLoop:
                     f"by turn {turn_index} — AttachTopic only ever runs on "
                     "turn 0"
                 )
+        # else: concept graph disabled (AblationConfig.enable_concept_graph
+        # =False) — current_graph_id is left exactly as read above
+        # (normally None for the session's whole lifetime), AttachTopic
+        # never runs, and the turn-past-0 hard-fail above is
+        # deliberately bypassed: it exists to protect a configuration
+        # this one intentionally disables.
 
         diagnose_result = await self._call_node_or_warn(
             self.diagnose,
@@ -530,6 +776,9 @@ class SessionLoop:
             expectation=self._last_teach_message,
             session_id=session_id,
             turn_id=turn_id,
+            enable_grounding=self._ablation.enable_concept_graph,
+            enable_mismatch=self._ablation.enable_diagnose,
+            enable_hypotheses=self._ablation.enable_portrait,
         )
         node_call_counts["Diagnose"] = diagnose_result["llm_call_count"]
 
@@ -553,33 +802,45 @@ class SessionLoop:
         # is what actually makes "never reweight another learner's
         # hypothesis" true, not just "won't see one" — this scoping is
         # what makes that check meaningful in the first place.
-        active_hypotheses = await self._hyp.list_by_learner(learner_id)
+        #
+        # AblationConfig.enable_portrait=False skips this block
+        # entirely: Infer and Update never run (no node_calls rows for
+        # either), and HypothesisStore is never read. Replan/Plan below
+        # still run, just against an empty hypothesis list — they don't
+        # touch HypothesisStore themselves, so passing them [] is enough
+        # to make "nothing reads HypothesisStore" true without needing
+        # to also skip Replan/Plan.
+        if self._ablation.enable_portrait:
+            active_hypotheses = await self._hyp.list_by_learner(learner_id)
 
-        proposals = await self._call_node_or_warn(
-            self.infer,
-            session_id,
-            turn_index,
-            "Infer",
-            [],
-            warnings,
-            turn_text=turn_text,
-            hypotheses=active_hypotheses,
-            generation_width=self._generation_width,
-        )
-        node_call_counts["Infer"] = self.infer.last_call_count
+            proposals = await self._call_node_or_warn(
+                self.infer,
+                session_id,
+                turn_index,
+                "Infer",
+                InferOutput(),
+                warnings,
+                turn_text=turn_text,
+                hypotheses=active_hypotheses,
+                turn_id=turn_id,
+                generation_width=self._generation_width,
+            )
+            node_call_counts["Infer"] = self.infer.last_call_count
 
-        await self._call_node_or_warn(
-            self.update,
-            session_id,
-            turn_index,
-            "Update",
-            [],
-            warnings,
-            proposals=proposals,
-            hypothesis_store=self._hyp,
-        )
+            await self._call_node_or_warn(
+                self.update,
+                session_id,
+                turn_index,
+                "Update",
+                [],
+                warnings,
+                proposals=proposals,
+                hypothesis_store=self._hyp,
+            )
 
-        refreshed_hypotheses = await self._hyp.list_by_learner(learner_id)
+            refreshed_hypotheses = await self._hyp.list_by_learner(learner_id)
+        else:
+            refreshed_hypotheses = []
 
         budget = await self._call_node_or_warn(
             self.replan,
@@ -590,8 +851,19 @@ class SessionLoop:
             warnings,
             hypotheses=refreshed_hypotheses,
         )
-        self._generation_width = budget.generation_width
-        self._exploration_target = budget.exploration_target
+        # reasoning_budget_mode=FIXED pins generation_width to a config
+        # value instead of scaling with entropy; enable_exploration_slot
+        # =False forces exploration_target to None regardless of what
+        # Replan computed (see __init__'s min_exploration_slots=0 for
+        # the width-accuracy half of this same ablation).
+        self._generation_width = (
+            self._ablation.fixed_generation_width
+            if self._ablation.reasoning_budget_mode is ReasoningBudgetMode.FIXED
+            else budget.generation_width
+        )
+        self._exploration_target = (
+            budget.exploration_target if self._ablation.enable_exploration_slot else None
+        )
         # AND, not overwrite: a turn never re-enables a term an explicit
         # ablation config disabled — it can only skip a term the base
         # config already allowed.
@@ -599,29 +871,68 @@ class SessionLoop:
             self._base_enable_information_value and budget.run_information_value
         )
 
-        plan_fallback = PlanOutput(
-            winner=CandidateAction(
-                action=_PLAN_FALLBACK_ACTION,
-                target_concept=None,
-                rationale="Plan failed this turn — deterministic fallback, no scoring",
-            ),
-            scores=[],
+        # Before Plan runs: does this turn's message contain a concrete,
+        # answerable request? If so, it takes precedence over whatever
+        # Plan/DerivePath would otherwise choose to teach toward — see
+        # module docstring and ExtractRequest's own docstring.
+        explicit_request = await self._call_node_or_warn(
+            self.extract_request,
+            session_id,
+            turn_index,
+            "ExtractRequest",
+            ExplicitRequest(present=False, what=None),
+            warnings,
+            turn_text=turn_text,
         )
+        node_call_counts["ExtractRequest"] = self.extract_request.last_call_count
+
         concept_state = await self._build_concept_state(
             current_graph_id, learner_id, diagnose_result
         )
-        plan_output = await self._call_node_or_warn(
-            self.plan,
-            session_id,
-            turn_index,
-            "Plan",
-            plan_fallback,
-            warnings,
-            hypotheses=refreshed_hypotheses,
-            concept_state=concept_state,
-            generation_width=self._generation_width,
-            exploration_target=self._exploration_target,
-        )
+        if self._ablation.enable_planner:
+            plan_fallback = PlanOutput(
+                winner=CandidateAction(
+                    action=_PLAN_FALLBACK_ACTION,
+                    target_concept=None,
+                    rationale="Plan failed this turn — deterministic fallback, no scoring",
+                ),
+                scores=[],
+            )
+            plan_output = await self._call_node_or_warn(
+                self.plan,
+                session_id,
+                turn_index,
+                "Plan",
+                plan_fallback,
+                warnings,
+                hypotheses=refreshed_hypotheses,
+                concept_state=concept_state,
+                generation_width=self._generation_width,
+                exploration_target=self._exploration_target,
+                explicit_request=explicit_request,
+            )
+        else:
+            # AblationConfig.enable_planner=False: Plan itself never
+            # runs — no proposer call, no scoring calls, deliberately
+            # no node_calls row. target_concept still comes from
+            # grounding (free, already-computed data, not a new LLM
+            # call) when concept grounding is on; None otherwise, same
+            # as _PLAN_FALLBACK_ACTION's own target_concept=None.
+            grounded_concept_id = (
+                concept_state.get("grounded_concept_id")
+                if isinstance(concept_state, dict)
+                else None
+            )
+            plan_output = PlanOutput(
+                winner=CandidateAction(
+                    action=TeachingAction.EXPLAIN,
+                    target_concept=(
+                        str(grounded_concept_id) if grounded_concept_id else None
+                    ),
+                    rationale="answer the student's question",
+                ),
+                scores=[],
+            )
         plan_scoring_calls = sum(
             s.learning_value_call_count
             + s.information_value_call_count
@@ -629,7 +940,8 @@ class SessionLoop:
             + s.frustration_risk_call_count
             for s in plan_output.scores
         )
-        node_call_counts["Plan"] = self.plan.last_generate_call_count + plan_scoring_calls
+        if self._ablation.enable_planner:
+            node_call_counts["Plan"] = self.plan.last_generate_call_count + plan_scoring_calls
 
         # BranchGenerate -> SelectBranch -> DerivePath, all before
         # Teach: the tree now conditions on the student's message
@@ -645,7 +957,10 @@ class SessionLoop:
         path_requirement = None
         current_belief_unsupported = False
         option_texts: list[str] = []
-        if self.branch_generate is not None:
+        generation_skipped_reason: str | None = None
+        if self.branch_generate is not None and turn_index == 0:
+            generation_skipped_reason = _TURN_ZERO_GENERATION_SKIP_REASON
+        elif self.branch_generate is not None:
             transcript_context = await self._build_transcript_context(
                 session_id, self._last_options_missed
             )
@@ -732,6 +1047,7 @@ class SessionLoop:
                                 path=path,
                                 student_message=turn_text,
                                 action_rationale=plan_output.winner.rationale,
+                                explicit_request=explicit_request,
                             )
                             if path_result is not None:
                                 node_call_counts["DerivePath"] = (
@@ -781,6 +1097,11 @@ class SessionLoop:
         # below as a warning so match-rate analysis can see why a
         # miss happened, not silently misinterpret it as the mechanism
         # being wrong.
+        teach_history = await self._build_teach_history(session_id, turn_index)
+        examples_used, last_artifact = await self._build_examples_used(
+            session_id, turn_index
+        )
+
         teach_failed = False
         try:
             message = await self._call_node(
@@ -791,6 +1112,9 @@ class SessionLoop:
                 student_message=turn_text,
                 path_requirement=path_requirement,
                 options=option_texts,
+                explicit_request=explicit_request,
+                recent_history=teach_history,
+                examples_used=examples_used,
             )
             node_call_counts["Teach"] = self.teach.last_call_count
         except Exception as exc:
@@ -812,6 +1136,64 @@ class SessionLoop:
                     "fallback failure message the student actually saw"
                 )
 
+        # Post-Teach backstop, same pattern as the current_belief leak
+        # check above: only meaningful when there was something to
+        # answer and Teach actually produced real output (not the
+        # fixed failure message) to check it against.
+        explicit_request_unaddressed = False
+        if explicit_request.present and explicit_request.what and not teach_failed:
+            explicit_request_unaddressed = check_explicit_request_unaddressed(
+                explicit_request.what, message
+            )
+            if explicit_request_unaddressed:
+                warnings.append(
+                    "explicit_request_unaddressed: the student's explicit "
+                    f"request ({explicit_request.what!r}) was not found "
+                    "worked out in Teach's response — either never "
+                    "mentioned, or only mentioned in a sentence that reads "
+                    "as deferring it to a future turn"
+                )
+
+        # ExtractTeachingArtifact runs once, right after Teach succeeds:
+        # pulls a structured example/analogy signal out of this turn's
+        # response for next turn's _build_examples_used/
+        # check_prior_reference_unaddressed to read back. Skipped
+        # entirely on a Teach failure — there's no real teaching
+        # content to extract anything from.
+        if not teach_failed:
+            await self._call_node_or_warn(
+                self.extract_teaching_artifact,
+                session_id,
+                turn_index,
+                "ExtractTeachingArtifact",
+                TeachingArtifact(example=None, analogy=None),
+                warnings,
+                teach_output=message,
+            )
+            node_call_counts["ExtractTeachingArtifact"] = (
+                self.extract_teaching_artifact.last_call_count
+            )
+
+        # Post-Teach backstop, same pattern as the explicit-request and
+        # current_belief checks above: only meaningful when the student
+        # plausibly pointed back at something already established and
+        # Teach actually produced real output to check it against.
+        prior_reference_detected = detect_prior_reference(turn_text)
+        prior_reference_unaddressed = False
+        if prior_reference_detected and not teach_failed:
+            prior_reference_unaddressed = check_prior_reference_unaddressed(
+                last_artifact, message
+            )
+            if prior_reference_unaddressed:
+                warnings.append(
+                    "prior_reference_unaddressed: the student appeared to "
+                    "reference something from earlier this session, but "
+                    "neither the example nor the analogy tracked from the "
+                    "immediately preceding turn appears in Teach's "
+                    "response — it may have introduced a new framing "
+                    "instead of naming what was referenced"
+                )
+
         # Monitoring guardrail, not a hard stop (see MAX_CALLS_PER_TURN):
         # the *complete* per-turn LLM-call count, not an undercount of
         # it — every LLM-calling node/term in this turn is instrumented
@@ -824,9 +1206,11 @@ class SessionLoop:
         total_call_count = (
             diagnose_result["llm_call_count"]
             + self.infer.last_call_count
+            + node_call_counts.get("ExtractRequest", 0)
             + self.plan.last_generate_call_count
             + plan_scoring_calls
             + node_call_counts.get("Teach", 0)
+            + node_call_counts.get("ExtractTeachingArtifact", 0)
             + resolution_call_count
             + generation_call_count
             + node_call_counts.get("SelectBranch", 0)
@@ -877,12 +1261,399 @@ class SessionLoop:
                     retry_count=_total_retry_count(self._tiers) - retry_count_start,
                     options_missed=options_missed,
                     current_belief_unsupported=current_belief_unsupported,
+                    generation_skipped_reason=generation_skipped_reason,
+                    explicit_request_present=explicit_request.present,
+                    explicit_request_what=explicit_request.what,
+                    explicit_request_unaddressed=explicit_request_unaddressed,
+                    prior_reference_detected=prior_reference_detected,
+                    prior_reference_unaddressed=prior_reference_unaddressed,
                 )
             )
 
         self._last_teach_message = message
         self._last_options_missed = options_missed
         return message
+
+    async def _handle_bypass_turn(
+        self, session_id: UUID, turn_index: int, turn_text: str
+    ) -> str:
+        """AblationConfig.is_full_bypass's turn: student message -> one
+        LLM call (with prior turns in this session as context) ->
+        response. Deliberately does not reuse handle_turn's machinery
+        at all — every store touched here is the transcript (turns +
+        the one node_calls row for the call itself, plus turn_diagnostics
+        if configured, both cross-cutting observability rather than
+        reasoning state) and nothing else: no HypothesisStore,
+        ConceptGraph, BranchStore, OptionStore, LearnerOverlay, or
+        WorldModelRevisionStore read or written. This is what makes the
+        comparison honest — every other configuration's cost is
+        measured against this floor, so this floor must not itself
+        carry the loop's own overhead.
+        """
+        start = time.monotonic()
+        retry_count_start = _total_retry_count(self._tiers)
+
+        await self._transcript.record_turn(session_id, turn_index, turn_text)
+        prior_turns = [
+            t.text
+            for t in await self._transcript.list_turns(session_id)
+            if t.turn_index < turn_index
+        ]
+
+        # BaselineTeach is BASELINE's *only* call — unlike the full
+        # path, where Teach failing still leaves Diagnose/Infer/Plan/
+        # branches as evidence the turn ran, a failure here has no
+        # other node to fall back on. Same fixed-message-on-failure
+        # discipline as the normal path's own Teach handling, so a
+        # transient transport error degrades exactly like it does
+        # everywhere else in this loop rather than crashing the turn.
+        teach_failed = False
+        warnings: list[str] = []
+        try:
+            message = await self._call_node(
+                self.baseline_teach,
+                session_id,
+                turn_index,
+                turn_text=turn_text,
+                prior_turns=prior_turns,
+            )
+            call_count = self.baseline_teach.last_call_count
+        except Exception as exc:
+            teach_failed = True
+            message = _TEACH_FAILURE_MESSAGE
+            call_count = 0
+            warnings.append(f"BaselineTeach failed: {exc}")
+            logger.warning(
+                "BaselineTeach failed on turn %d for session %s: %s",
+                turn_index,
+                session_id,
+                exc,
+                exc_info=True,
+            )
+
+        if self._diagnostics is not None:
+            await self._diagnostics.record(
+                TurnDiagnostics(
+                    session_id=session_id,
+                    turn_index=turn_index,
+                    node_call_counts={"BaselineTeach": call_count},
+                    total_call_count=call_count,
+                    guardrail_fired=False,
+                    entropy_bits=None,
+                    duration_ms=(time.monotonic() - start) * 1000,
+                    warnings=warnings,
+                    teach_failed=teach_failed,
+                    retry_count=_total_retry_count(self._tiers) - retry_count_start,
+                )
+            )
+
+        self._last_teach_message = message
+        self._last_options_missed = False
+        return message
+
+    async def _handle_disambiguation_turn(
+        self,
+        session_id: UUID,
+        turn_index: int,
+        turn_text: str,
+        selected_option_id: UUID | None = None,
+    ) -> str:
+        """ReasoningMode.DISAMBIGUATE's turn — see disambiguate.py's
+        module docstring for the full flow. Deliberately does not reuse
+        `handle_turn`'s machinery at all: no HypothesisStore,
+        ConceptGraph, BranchStore/OptionStore (the tree-based ones),
+        or Plan touched here — this mode replaces that machinery
+        outright rather than ablating pieces of it.
+        """
+        assert self._disambiguation is not None, (
+            "ReasoningMode.DISAMBIGUATE requires disambiguation_store"
+        )
+        start = time.monotonic()
+        retry_count_start = _total_retry_count(self._tiers)
+        warnings: list[str] = []
+        node_call_counts: dict[str, int] = {}
+
+        await self._transcript.record_turn(session_id, turn_index, turn_text)
+
+        # Same compact recent-history window AssessAndBranch gets (see
+        # _build_disambiguation_history) -- computed once, up front, so
+        # every call site into FinalAnswer below (click resolution,
+        # direct answer, or the empty-options fallback) threads the
+        # identical context AssessAndBranch itself judged against.
+        # FinalAnswer's own prompt is otherwise unchanged: this is
+        # conversation continuity, not the portrait/concept-graph/
+        # planner "scaffolding" the spec's "no scaffolding" language
+        # meant to exclude -- see FinalAnswer's docstring for the live
+        # failure (turn 9's off-topic biology answer) this closes.
+        recent_history = await self._build_disambiguation_history(session_id, turn_index)
+
+        # 3a: a click resolves immediately -- no AssessAndBranch this
+        # turn, the reading is already known. An unrecognized/stale
+        # option id (e.g. from a superseded generation) falls through
+        # to the normal flow below exactly like handle_turn's own
+        # click-handling does for the tree-based system.
+        if selected_option_id is not None:
+            option = await self._disambiguation.get_option(selected_option_id)
+            if option is not None:
+                await self._disambiguation.set_option_status(
+                    option.id, OptionStatus.SELECTED
+                )
+                branch = await self._disambiguation.mark_matched(option.branch_id)
+                await self._disambiguation.supersede_open_branches(
+                    branch.disambiguation_turn_id, exclude_ids=[branch.id]
+                )
+                await self._disambiguation.supersede_open_options(option.generation_id)
+                self._prior_disambiguation_turn_id = None
+                message, teach_failed = await self._run_final_answer(
+                    session_id,
+                    turn_index,
+                    turn_text,
+                    branch.statement,
+                    recent_history,
+                    node_call_counts,
+                    warnings,
+                )
+                await self._record_disambiguation_diagnostics(
+                    session_id, turn_index, node_call_counts, warnings,
+                    teach_failed, start, retry_count_start,
+                )
+                self._last_teach_message = message
+                return message
+
+        # 3b: nothing was clicked. If the immediately preceding
+        # AssessAndBranch turn still has unresolved (open) branches,
+        # the student typed past them -- no attempt is made to match
+        # the typed text against that old set (see module docstring);
+        # it is superseded outright, and threaded into THIS turn's own
+        # fresh AssessAndBranch call as context instead.
+        typed_past_note = ""
+        prior_turn_id = self._prior_disambiguation_turn_id
+        self._prior_disambiguation_turn_id = None
+        if prior_turn_id is not None:
+            prior_branches = await self._disambiguation.list_branches_for_turn(
+                prior_turn_id
+            )
+            open_branches = [b for b in prior_branches if b.status is BranchStatus.OPEN]
+            if open_branches:
+                typed_past_note = build_typed_past_note(open_branches)
+                await self._disambiguation.supersede_open_branches(prior_turn_id)
+                await self._disambiguation.supersede_open_options(prior_turn_id)
+                warnings.append(
+                    "disambiguation_typed_past: student typed past the "
+                    "prior turn's options -- superseded, threaded as "
+                    "context into this turn's AssessAndBranch instead of "
+                    "being matched against"
+                )
+
+        assessment = await self._call_node_or_warn(
+            self.assess_and_branch,
+            session_id,
+            turn_index,
+            "AssessAndBranch",
+            DisambiguationAssessment(needs_branches=False, branch_statements=[]),
+            warnings,
+            message=turn_text,
+            recent_history=recent_history,
+            typed_past_note=typed_past_note,
+        )
+        node_call_counts["AssessAndBranch"] = self.assess_and_branch.last_call_count
+
+        if not assessment.needs_branches:
+            # Persisted unconditionally -- see disambiguate.py's module
+            # docstring / DisambiguationTurn's own docstring: a turn
+            # judged unambiguous is a queryable row, not a gap.
+            await self._disambiguation.create_turn(
+                session_id, turn_index, needs_branches=False, turn_had_direct_answer=True
+            )
+            message, teach_failed = await self._run_final_answer(
+                session_id, turn_index, turn_text, None, recent_history,
+                node_call_counts, warnings,
+            )
+            await self._record_disambiguation_diagnostics(
+                session_id, turn_index, node_call_counts, warnings,
+                teach_failed, start, retry_count_start,
+            )
+            self._last_teach_message = message
+            return message
+
+        disamb_turn = await self._disambiguation.create_turn(
+            session_id, turn_index, needs_branches=True, turn_had_direct_answer=False
+        )
+        branches = [
+            DisambiguationBranch(
+                disambiguation_turn_id=disamb_turn.id,
+                session_id=session_id,
+                turn_index=turn_index,
+                statement=statement,
+            )
+            for statement in assessment.branch_statements
+        ]
+        await self._disambiguation.add_branches(branches)
+
+        proposals = await self._call_node_or_warn(
+            self.disambiguation_options,
+            session_id,
+            turn_index,
+            "DisambiguationOptions",
+            [],
+            warnings,
+            branches=branches,
+        )
+        node_call_counts["DisambiguationOptions"] = (
+            self.disambiguation_options.last_call_count
+        )
+
+        if not proposals:
+            # GenerateOptions produced nothing usable -- graceful
+            # degrade (same discipline as the tree-based system's own
+            # GenerateOptions): answer directly rather than show
+            # broken/empty buttons or drop the turn.
+            warnings.append(
+                "disambiguation_options_empty: the message was judged "
+                "ambiguous but no usable options were generated -- "
+                "answering directly instead of showing nothing"
+            )
+            message, teach_failed = await self._run_final_answer(
+                session_id, turn_index, turn_text, None, recent_history,
+                node_call_counts, warnings,
+            )
+            await self._record_disambiguation_diagnostics(
+                session_id, turn_index, node_call_counts, warnings,
+                teach_failed, start, retry_count_start,
+            )
+            self._last_teach_message = message
+            return message
+
+        new_options = [
+            Option(
+                branch_id=p.branch_id,
+                generation_id=disamb_turn.id,
+                session_id=session_id,
+                turn_index=turn_index,
+                text=p.text,
+            )
+            for p in proposals
+        ]
+        await self._disambiguation.create_options(new_options)
+        self._prior_disambiguation_turn_id = disamb_turn.id
+
+        # No FinalAnswer this turn -- options are shown INSTEAD of an
+        # answer (see module docstring). The option texts themselves
+        # are read by the caller (web UI/CLI) from
+        # DisambiguationStore.list_options_for_turn, the same way the
+        # tree-based system's own options are read separately from
+        # handle_turn's string return value.
+        message = "Which of these did you mean?"
+        await self._record_disambiguation_diagnostics(
+            session_id, turn_index, node_call_counts, warnings,
+            teach_failed=False, start=start, retry_count_start=retry_count_start,
+        )
+        self._last_teach_message = message
+        return message
+
+    async def _run_final_answer(
+        self,
+        session_id: UUID,
+        turn_index: int,
+        turn_text: str,
+        branch_context: str | None,
+        recent_history: str,
+        node_call_counts: dict[str, int],
+        warnings: list[str],
+    ) -> tuple[str, bool]:
+        """FinalAnswer has no fallback -- its output IS the turn, same
+        discipline as Teach (see handle_turn's own dedicated
+        try/except for that one).
+
+        `recent_history` is the same window `AssessAndBranch` was
+        given this turn (see `_handle_disambiguation_turn`'s single,
+        shared computation of it) — FinalAnswer must not judge a
+        different, poorer context than AssessAndBranch already
+        reasoned against."""
+        try:
+            message = await self._call_node(
+                self.final_answer,
+                session_id,
+                turn_index,
+                student_message=turn_text,
+                branch_context=branch_context,
+                recent_history=recent_history,
+            )
+            node_call_counts["FinalAnswer"] = self.final_answer.last_call_count
+            return message, False
+        except Exception as exc:
+            warnings.append(f"FinalAnswer failed: {exc}")
+            logger.warning(
+                "FinalAnswer failed on turn %d for session %s: %s",
+                turn_index,
+                session_id,
+                exc,
+                exc_info=True,
+            )
+            node_call_counts["FinalAnswer"] = 0
+            return _TEACH_FAILURE_MESSAGE, True
+
+    async def _build_disambiguation_history(
+        self, session_id: UUID, turn_index: int
+    ) -> str:
+        """Compact recent-history input shared by `AssessAndBranch` and
+        `FinalAnswer` (see `_handle_disambiguation_turn`, which computes
+        this once per turn and threads it into both) — same small-N/
+        read-from-node_calls discipline as `_build_teach_history`,
+        against `FinalAnswer`'s own node_calls rather than `Teach`'s
+        (this mode never calls Teach)."""
+        if turn_index == 0:
+            return ""
+        turns = [
+            t
+            for t in await self._transcript.list_turns(session_id)
+            if t.turn_index < turn_index
+        ][-_TEACH_HISTORY_TURNS:]
+        answer_calls = await self._node_calls.get_recent_calls(
+            session_id, "FinalAnswer", turn_index, _TEACH_HISTORY_TURNS
+        )
+        answers_by_turn = {c.turn_index: c.output_json for c in answer_calls}
+        lines: list[str] = []
+        for t in turns:
+            lines.append(f"turn {t.turn_index} student: {t.text}")
+            answer = answers_by_turn.get(t.turn_index)
+            if answer:
+                lines.append(f"turn {t.turn_index} tutor: {answer}")
+        return "\n".join(lines)
+
+    async def _record_disambiguation_diagnostics(
+        self,
+        session_id: UUID,
+        turn_index: int,
+        node_call_counts: dict[str, int],
+        warnings: list[str],
+        teach_failed: bool,
+        start: float,
+        retry_count_start: int,
+    ) -> None:
+        if self._diagnostics is None:
+            return
+        total_call_count = sum(node_call_counts.values())
+        guardrail_fired = total_call_count > MAX_CALLS_PER_TURN
+        if guardrail_fired:
+            warnings.append(
+                f"MAX_CALLS_PER_TURN exceeded: {total_call_count} calls "
+                f"(limit {MAX_CALLS_PER_TURN})"
+            )
+        await self._diagnostics.record(
+            TurnDiagnostics(
+                session_id=session_id,
+                turn_index=turn_index,
+                node_call_counts=node_call_counts,
+                total_call_count=total_call_count,
+                guardrail_fired=guardrail_fired,
+                entropy_bits=None,
+                duration_ms=(time.monotonic() - start) * 1000,
+                warnings=warnings,
+                teach_failed=teach_failed,
+                retry_count=_total_retry_count(self._tiers) - retry_count_start,
+            )
+        )
 
     async def _build_concept_state(
         self,
@@ -957,6 +1728,78 @@ class SessionLoop:
                 "branch set is asking the right question.]"
             )
         return "\n".join(lines)
+
+    async def _build_teach_history(self, session_id: UUID, turn_index: int) -> str:
+        """Compact, small-N recent history for Teach only (item 1 of
+        the working-memory fix) — the last `_TEACH_HISTORY_TURNS`
+        student turns paired with Teach's own responses to them, so
+        Teach can notice it already answered something, already used a
+        framing, or already stated a constraint, instead of
+        contradicting or ignoring its own last few turns.
+
+        Reads Teach's past output back out of node_calls
+        (NodeCallStore.get_recent_calls) rather than a second
+        persistence path for the same text — CLAUDE.md invariant 2
+        already guarantees it's there. Empty on turn 0 (nothing prior
+        to read)."""
+        if turn_index == 0:
+            return ""
+        turns = [
+            t
+            for t in await self._transcript.list_turns(session_id)
+            if t.turn_index < turn_index
+        ][-_TEACH_HISTORY_TURNS:]
+        teach_calls = await self._node_calls.get_recent_calls(
+            session_id, "Teach", turn_index, _TEACH_HISTORY_TURNS
+        )
+        teach_by_turn = {c.turn_index: c.output_json for c in teach_calls}
+        lines: list[str] = []
+        for t in turns:
+            lines.append(f"turn {t.turn_index} student: {t.text}")
+            tutor_text = teach_by_turn.get(t.turn_index)
+            if tutor_text:
+                lines.append(f"turn {t.turn_index} you (tutor): {tutor_text}")
+        return "\n".join(lines)
+
+    async def _build_examples_used(
+        self, session_id: UUID, turn_index: int
+    ) -> tuple[str, TeachingArtifact | None]:
+        """Structured record of concrete examples/analogies already
+        used this session (item 2 of the working-memory fix), read
+        back from ExtractTeachingArtifact's own node_calls — capped at
+        `_MAX_TRACKED_ARTIFACTS` so a very long session's prompt stays
+        bounded, not because only recent ones matter.
+
+        Also returns the single most recent tracked call's artifact
+        (`None` on turn 0, or if it tracked neither an example nor an
+        analogy) for `check_prior_reference_unaddressed`'s "you just
+        gave" check, which only ever means the immediately preceding
+        turn — not "the most recent turn that happened to have
+        something," which is why this is read separately from the
+        display lines below rather than reusing their last entry."""
+        if turn_index == 0:
+            return "", None
+        calls = await self._node_calls.get_recent_calls(
+            session_id, "ExtractTeachingArtifact", turn_index, _MAX_TRACKED_ARTIFACTS
+        )
+        lines: list[str] = []
+        for c in calls:
+            data = c.output_json or {}
+            example, analogy = data.get("example"), data.get("analogy")
+            if not example and not analogy:
+                continue
+            parts = [p for p in (
+                f"example: {example}" if example else None,
+                f"analogy: {analogy}" if analogy else None,
+            ) if p]
+            lines.append(f"turn {c.turn_index} — " + "; ".join(parts))
+        last_artifact = None
+        if calls:
+            data = calls[-1].output_json or {}
+            example, analogy = data.get("example"), data.get("analogy")
+            if example or analogy:
+                last_artifact = TeachingArtifact(example=example, analogy=analogy)
+        return "\n".join(lines), last_artifact
 
     async def _call_node_or_warn(
         self,

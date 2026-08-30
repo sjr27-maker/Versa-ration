@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import asyncpg
 from pydantic import BaseModel
 
+from probe.ablation import AblationConfig
 from probe.models import NodeCall, SessionSummary, TurnRecord
 
 
@@ -54,22 +55,76 @@ class TranscriptStore:
         learner_id: UUID,
         concept_graph_id: UUID | None = None,
         session_id: UUID | None = None,
+        ablation_config: AblationConfig | None = None,
     ) -> UUID:
         # concept_graph_id is nullable as of migration 013: a session
         # created with no topic yet (web UI's "no topic input" setup)
         # gets one attached by AttachTopic on its first turn instead —
         # SessionLoop.handle_turn hard-fails on any turn past the
         # first if it's still null by then.
+        #
+        # ablation_config is fixed for the session's lifetime (see
+        # set_ablation_config's raise-if-turns-exist guard below) — None
+        # here means "full system," stored as SQL NULL rather than a
+        # serialized AblationConfig() so get_ablation_config's default
+        # interpretation stays the single source of truth for what NULL
+        # means, not duplicated into every INSERT.
         session_id = session_id or uuid4()
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO sessions (id, learner_id, concept_graph_id) "
-                "VALUES ($1, $2, $3)",
+                "INSERT INTO sessions (id, learner_id, concept_graph_id, ablation_config) "
+                "VALUES ($1, $2, $3, $4)",
                 session_id,
                 learner_id,
                 concept_graph_id,
+                ablation_config.model_dump(mode="json") if ablation_config else None,
             )
         return session_id
+
+    async def get_ablation_config(self, session_id: UUID) -> AblationConfig:
+        """The AblationConfig a session was created with — NULL (never
+        set, or created before migration 025) is interpreted as
+        `AblationConfig()`'s full-system default, which is exactly what
+        every such session actually runs with."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT ablation_config FROM sessions WHERE id = $1", session_id
+            )
+        if row is None:
+            raise KeyError(f"session {session_id} not found")
+        stored = row["ablation_config"]
+        return AblationConfig() if stored is None else AblationConfig(**stored)
+
+    async def set_ablation_config(
+        self, session_id: UUID, ablation_config: AblationConfig
+    ) -> None:
+        """Config is fixed at session creation — this exists only to
+        raise clearly if something attempts to change it after turns
+        have happened, not as a normal write path. Switching config
+        mid-session would make every turn after the switch
+        uninterpretable (which layer produced that turn's behavior?)
+        and let hypotheses accumulated under one config silently carry
+        into another."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT id FROM sessions WHERE id = $1 FOR UPDATE", session_id
+                )
+                if row is None:
+                    raise KeyError(f"session {session_id} not found")
+                turn_count = await conn.fetchval(
+                    "SELECT count(*) FROM turns WHERE session_id = $1", session_id
+                )
+                if turn_count > 0:
+                    raise ValueError(
+                        f"session {session_id} already has {turn_count} turn(s) "
+                        "-- ablation_config cannot change mid-session"
+                    )
+                await conn.execute(
+                    "UPDATE sessions SET ablation_config = $2 WHERE id = $1",
+                    session_id,
+                    ablation_config.model_dump(mode="json"),
+                )
 
     async def get_learner_id(self, session_id: UUID) -> UUID:
         """The learner a session belongs to — set once at creation, not
@@ -266,7 +321,7 @@ class NodeCallStore:
                 """
                 SELECT * FROM node_calls
                 WHERE session_id = $1 AND turn_index = $2 AND node_name = $3
-                ORDER BY timestamp DESC
+                ORDER BY seq DESC
                 LIMIT 1
                 """,
                 session_id,
@@ -274,6 +329,32 @@ class NodeCallStore:
                 node_name,
             )
         return None if row is None else NodeCall(**dict(row))
+
+    async def get_recent_calls(
+        self, session_id: UUID, node_name: str, before_turn_index: int, limit: int
+    ) -> list[NodeCall]:
+        """The last `limit` calls to `node_name` strictly before
+        `before_turn_index`, chronological (oldest first) — e.g.
+        Teach's own compact recent-history input (loop.py's
+        `_build_teach_history`) and the examples/analogies list built
+        from ExtractTeachingArtifact's calls (`_build_examples_used`).
+        Reads a node's own past output straight back out of the audit
+        trail invariant 2 already requires, rather than a second
+        persistence path for the same text."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM node_calls
+                WHERE session_id = $1 AND node_name = $2 AND turn_index < $3
+                ORDER BY turn_index DESC, seq DESC
+                LIMIT $4
+                """,
+                session_id,
+                node_name,
+                before_turn_index,
+                limit,
+            )
+        return list(reversed([NodeCall(**dict(row)) for row in rows]))
 
     async def get_latest_call(
         self, session_id: UUID, node_name: str
@@ -287,7 +368,7 @@ class NodeCallStore:
                 """
                 SELECT * FROM node_calls
                 WHERE session_id = $1 AND node_name = $2
-                ORDER BY turn_index DESC, timestamp DESC
+                ORDER BY turn_index DESC, seq DESC
                 LIMIT 1
                 """,
                 session_id,

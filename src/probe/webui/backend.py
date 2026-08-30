@@ -38,6 +38,7 @@ from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
+from probe.disambiguate import DisambiguationStore
 from probe.learner import LearnerStore
 from probe.llm import ModelTierClients, StubLLMClient, build_tier_clients
 from probe.options import OptionStore
@@ -113,6 +114,7 @@ class Stores:
         self.options = OptionStore(pool)
         self.diagnostics = TurnDiagnosticsStore(pool)
         self.learners = LearnerStore(pool)
+        self.disambiguation = DisambiguationStore(pool)
 
 
 def get_stores() -> Stores:

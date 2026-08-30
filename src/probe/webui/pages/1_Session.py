@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from probe.ablation import ReasoningMode
 from probe.hypothesis_generator import build_branch_path
 from probe.loop import SessionLoop
 from probe.models import BranchStatus, OptionStatus, Tier
@@ -38,6 +39,11 @@ stores = get_stores()
 # in-memory only, same as the CLI's run_interactive — recreating the
 # loop between turns would silently reset all of it.
 use_stub = st.session_state.get("use_stub", False)
+# Fixed at session creation (app.py) and never re-read after — a
+# session's config is set-once (TranscriptStore.set_ablation_config
+# raises past turn 0), so caching it alongside the loop instance below
+# is exactly as safe as caching the loop itself.
+ablation_config = run_async(stores.transcript.get_ablation_config(session_id))
 if (
     "loop" not in st.session_state
     or st.session_state.get("loop_session_id") != session_id
@@ -58,6 +64,8 @@ if (
         option_store=stores.options,
         diagnostics_store=stores.diagnostics,
         on_node_start=on_node_start,
+        ablation_config=ablation_config,
+        disambiguation_store=stores.disambiguation,
     )
     st.session_state["progress"] = progress
     st.session_state["loop_session_id"] = session_id
@@ -87,6 +95,26 @@ if graph_id is not None:
 st.caption(
     f"Learner: {learner.label or learner.id}  ·  topic: {topic or '(not yet attached)'}"
 )
+
+if ablation_config.is_full_bypass:
+    st.warning("⚗ BASELINE — plain LLM, every subsystem off. Fixed for this session.")
+else:
+    _off = [
+        name
+        for name, enabled in [
+            ("portrait", ablation_config.enable_portrait),
+            ("concept_graph", ablation_config.enable_concept_graph),
+            ("diagnose", ablation_config.enable_diagnose),
+            ("planner", ablation_config.enable_planner),
+            ("branches", ablation_config.enable_branches),
+            ("options", ablation_config.enable_options),
+        ]
+        if not enabled
+    ]
+    st.info(
+        "⚗ Ablation config (fixed for this session): "
+        + ("full system — everything on" if not _off else f"off: {', '.join(_off)}")
+    )
 
 left, right = st.columns([3, 2])
 
@@ -128,18 +156,37 @@ with left:
     # Options pending from the most recent turn's generation — both
     # channels stay enabled: clicking one here satisfies its branch
     # directly (no LLM call); typing in the box below instead still
-    # gets a chance via CheckEvidence. Only ever the *latest*
-    # generation's still-open options: resolve() supersedes whatever's
-    # left the moment the next turn starts, on either path.
+    # gets a chance via CheckEvidence (full system) or is treated as
+    # typing past the options (minimal_branch — see disambiguate.py).
+    # Only ever the *latest* generation's still-open options: resolve()
+    # (full system) or a click/typed-past turn (minimal_branch)
+    # supersedes whatever's left the moment the next turn starts.
+    #
+    # Two entirely separate stores/tables back this, by reasoning_mode
+    # (see disambiguate.py's module docstring for why: the tree-based
+    # options table has a hard FK to the tree-based branches table, so
+    # minimal_branch's flat branches/options cannot live there) — reads
+    # the same `Option`/`OptionStatus` shape either way, so the
+    # rendering below needs no branch of its own.
     pending_options = []
-    latest_generation_for_options = run_async(
-        stores.branches.get_latest_generation(session_id)
-    )
-    if latest_generation_for_options is not None:
-        all_options = run_async(
-            stores.options.list_by_generation(latest_generation_for_options.id)
+    if ablation_config.reasoning_mode is ReasoningMode.DISAMBIGUATE:
+        latest_disambiguation_turn = run_async(
+            stores.disambiguation.get_latest_turn(session_id)
         )
-        pending_options = [o for o in all_options if o.status is OptionStatus.OPEN]
+        if latest_disambiguation_turn is not None:
+            all_options = run_async(
+                stores.disambiguation.list_options_for_turn(latest_disambiguation_turn.id)
+            )
+            pending_options = [o for o in all_options if o.status is OptionStatus.OPEN]
+    else:
+        latest_generation_for_options = run_async(
+            stores.branches.get_latest_generation(session_id)
+        )
+        if latest_generation_for_options is not None:
+            all_options = run_async(
+                stores.options.list_by_generation(latest_generation_for_options.id)
+            )
+            pending_options = [o for o in all_options if o.status is OptionStatus.OPEN]
 
     progress_placeholder = st.empty()
 
@@ -393,6 +440,35 @@ with right:
                     "Teach may have affirmed something as said that wasn't — "
                     "check this turn's tutor message."
                 )
+            if diagnostics.explicit_request_present:
+                if diagnostics.explicit_request_unaddressed:
+                    st.error(
+                        "⚠ explicit_request_unaddressed — the student's "
+                        f"explicit request (**{diagnostics.explicit_request_what}**) "
+                        "was not found worked out in Teach's response: either "
+                        "never mentioned, or only mentioned in a sentence that "
+                        "reads as deferring it to a future turn. Check this "
+                        "turn's tutor message."
+                    )
+                else:
+                    st.success(
+                        f"Explicit request detected and addressed: "
+                        f"**{diagnostics.explicit_request_what}**"
+                    )
+            if diagnostics.prior_reference_detected:
+                if diagnostics.prior_reference_unaddressed:
+                    st.error(
+                        "⚠ prior_reference_unaddressed — the student appeared "
+                        "to reference something from earlier this session, "
+                        "but neither the example nor the analogy tracked "
+                        "from the immediately preceding turn appears in "
+                        "Teach's response. Check whether it introduced a "
+                        "new framing instead of naming what was referenced."
+                    )
+                else:
+                    st.success(
+                        "Prior reference detected and named in Teach's response."
+                    )
             if diagnostics.warnings:
                 st.markdown("**Warnings**")
                 for w in diagnostics.warnings:

@@ -92,9 +92,12 @@ async def test_leaked_current_belief_sets_the_diagnostics_flag(
                        revision_store, branch_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "what is parallel computing")
+    # Turn 0 never generates (see loop.py) — the generation this test
+    # is about starts on turn 1.
+    await loop.handle_turn(session_id, 0, "hello")
+    await loop.handle_turn(session_id, 1, "what is parallel computing")
 
-    diag = await diagnostics_store.get_for_turn(session_id, 0)
+    diag = await diagnostics_store.get_for_turn(session_id, 1)
     assert diag.current_belief_unsupported is True
     assert any("current_belief_unsupported" in w for w in diag.warnings)
 
@@ -116,8 +119,11 @@ async def test_grounded_current_belief_does_not_set_the_flag(
                        revision_store, branch_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "what is parallel computing")
+    # Turn 0 never generates (see loop.py) — the generation this test
+    # is about starts on turn 1.
+    await loop.handle_turn(session_id, 0, "hello")
+    await loop.handle_turn(session_id, 1, "what is parallel computing")
 
-    diag = await diagnostics_store.get_for_turn(session_id, 0)
+    diag = await diagnostics_store.get_for_turn(session_id, 1)
     assert diag.current_belief_unsupported is False
     assert not any("current_belief_unsupported" in w for w in diag.warnings)

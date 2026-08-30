@@ -219,3 +219,40 @@ not taken, which is exactly the kind of fact CLAUDE.md invariant 1's
 options channel: an option is not written into `HypothesisStore`
 either (same wall as invariant 6 describes for branches) — it only
 ever flips `evidence_satisfied` on the branch it maps to.
+
+### 9. The disambiguation store is append-only
+
+`DisambiguationStore` (`disambiguation_turns`/`disambiguation_branches`/
+`disambiguation_options`) must never delete rows. Concretely:
+
+- No `delete` / `remove` methods on the class.
+- No `DELETE` SQL anywhere in the `disambiguate` module or its
+  migrations.
+- Resolution is modeled by moving a branch's or option's `status` from
+  `open` to `matched`/`selected` or `superseded` via UPDATE, not by
+  removing it — same transitions as invariants 6 and 8, on this mode's
+  own tables.
+- `disambiguation_turns` is written once per `AssessAndBranch` call,
+  unconditionally, whether or not `needs_branches` fires — a turn
+  judged unambiguous is still a queryable row with zero branches, not
+  a gap.
+- Verified by the same AST-based check used for invariants 1, 4, 6, 7,
+  and 8.
+
+This is a separate invariant from invariants 6 and 8, not a
+restatement of either: `ReasoningMode.DISAMBIGUATE` (see ablation.py)
+is a wholly separate reasoning architecture from the branch tree/
+options system those invariants describe, running against its own
+parallel tables rather than the `branches`/`options` tables — see
+disambiguate.py's module docstring for why those tables couldn't be
+literally reused (`options.branch_id`'s FK to `branches(id)`) and,
+more importantly, why they shouldn't be: the existing tree-based
+system still depends on every column `branches` already has, and this
+new mode must not require altering it.
+
+Why: same rationale as invariants 6 and 8, extended to this mode — a
+distinct reading the student typed past, or a branch set generated for
+a message later judged unambiguous, is still a fact about how this
+mode reasoned about that turn. Deleting any of it would erase the same
+kind of "what was actually offered, and what happened to it" trail
+invariant 8 protects, just for a different architecture.

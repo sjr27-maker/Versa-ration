@@ -13,10 +13,12 @@ store in this project.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from uuid import UUID
 
 import asyncpg
 
+from probe.ablation import AblationConfig, AblationCostSummary
 from probe.models import TurnDiagnostics
 from probe.row_mapping import assert_row_consumed
 
@@ -34,8 +36,11 @@ class TurnDiagnosticsStore:
                     total_call_count, guardrail_fired, entropy_bits,
                     duration_ms, warnings, teach_failed, inferred_topic,
                     topic_seeded_new, retry_count, options_missed,
-                    current_belief_unsupported, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                    current_belief_unsupported, generation_skipped_reason,
+                    explicit_request_present, explicit_request_what,
+                    explicit_request_unaddressed, prior_reference_detected,
+                    prior_reference_unaddressed, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
                 """,
                 diagnostics.id,
                 diagnostics.session_id,
@@ -52,6 +57,12 @@ class TurnDiagnosticsStore:
                 diagnostics.retry_count,
                 diagnostics.options_missed,
                 diagnostics.current_belief_unsupported,
+                diagnostics.generation_skipped_reason,
+                diagnostics.explicit_request_present,
+                diagnostics.explicit_request_what,
+                diagnostics.explicit_request_unaddressed,
+                diagnostics.prior_reference_detected,
+                diagnostics.prior_reference_unaddressed,
                 diagnostics.created_at,
             )
         return diagnostics
@@ -74,6 +85,54 @@ class TurnDiagnosticsStore:
                 session_id,
             )
         return [self._row_to_diagnostics(row) for row in rows]
+
+    async def mean_cost_by_config(self) -> list[AblationCostSummary]:
+        """"What does this config cost" — mean per-turn wall-clock,
+        call count, and retry count across every turn recorded under an
+        identical AblationConfig, regardless of session. Grouping
+        happens in Python, not SQL: a session's `ablation_config` is
+        SQL NULL for "full system" (see TranscriptStore.get_ablation_config),
+        and a NULL row must land in the exact same bucket as a session
+        that stored the literal full-system config explicitly — hard-
+        coding that equivalence as a SQL literal would drift the moment
+        AblationConfig gains a field, where resolving both through
+        AblationConfig() in Python cannot.
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    s.ablation_config,
+                    td.duration_ms,
+                    td.total_call_count,
+                    td.retry_count
+                FROM turn_diagnostics td
+                JOIN sessions s ON s.id = td.session_id
+                """
+            )
+
+        buckets: dict[str, list[dict]] = defaultdict(list)
+        configs_by_key: dict[str, AblationConfig] = {}
+        for row in rows:
+            stored = row["ablation_config"]
+            config = AblationConfig() if stored is None else AblationConfig(**stored)
+            key = config.model_dump_json()
+            configs_by_key[key] = config
+            buckets[key].append(dict(row))
+
+        summaries: list[AblationCostSummary] = []
+        for key, turn_rows in buckets.items():
+            n = len(turn_rows)
+            summaries.append(
+                AblationCostSummary(
+                    ablation_config=configs_by_key[key],
+                    turn_count=n,
+                    mean_duration_ms=sum(r["duration_ms"] for r in turn_rows) / n,
+                    mean_call_count=sum(r["total_call_count"] for r in turn_rows) / n,
+                    mean_retry_count=sum(r["retry_count"] for r in turn_rows) / n,
+                )
+            )
+        return summaries
 
     def _row_to_diagnostics(self, row) -> TurnDiagnostics:
         mapped = dict(row)

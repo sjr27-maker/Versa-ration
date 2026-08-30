@@ -120,9 +120,20 @@ _DEFAULT_PATH_REQUIREMENT = json.dumps(
 
 
 _DEFAULT_RESPONSES: dict[str, str] = {
-    # Existing loop nodes.
+    # Existing loop nodes. "[]" is a valid response under both the old
+    # reweight-only contract and the current reweight-or-create one —
+    # no test that doesn't opt in proposes anything either way.
     "INFER:": "[]",
     "TEACH:": "[stub teach]",
+    "BASELINE:TEACH": "[stub baseline teach]",
+    # Conservative default: no explicit request detected, so Plan/
+    # DerivePath/Teach's precedence logic doesn't activate unless a
+    # test opts in — same convention as MISMATCH/GROUND/RESOLVE.
+    "EXTRACT:REQUEST": json.dumps({"present": False, "what": None}),
+    # Conservative default: nothing extracted, so a test that doesn't
+    # opt in doesn't need to fabricate a fake example/analogy for
+    # ExtractTeachingArtifact's "already used" list to stay accurate.
+    "EXTRACT:ARTIFACT": json.dumps({"example": None, "analogy": None}),
     "PROPOSE:ACTIONS": _DEFAULT_PROPOSALS,
     "SEED:CONCEPT_GRAPH": _DEFAULT_CONCEPT_BATCH,
     # Conservative default: no mismatch, so MismatchDetector doesn't
@@ -159,6 +170,15 @@ _DEFAULT_RESPONSES: dict[str, str] = {
     "CHECK:EVIDENCE": json.dumps({"satisfied_branch_id": None, "confidence": 0.0}),
     # AttachTopic's topic-extraction call.
     "TOPIC:INFER": json.dumps({"topic": "stub topic"}),
+    # disambiguate.py's minimal three-call mode. Conservative default:
+    # not ambiguous, so a test that doesn't opt in goes straight to the
+    # 1-call direct-answer path rather than needing to fabricate
+    # branches.
+    "ASSESS:BRANCH": json.dumps({"needs_branches": False, "branches": []}),
+    # Conservative default: no options, same convention as
+    # GENERATE:OPTIONS — an empty list is valid, not rejected.
+    "DISAMBIGUATE:OPTIONS": "[]",
+    "FINAL:ANSWER": "[stub final answer]",
 }
 
 
@@ -230,19 +250,41 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
     # prompt, not something this client should paper over by inventing
     # a turn_id the model was never told.
     "INFER:": {
+        # Flat, not oneOf: a "reweight" item uses hypothesis_id/
+        # new_probability/new_confidence/polarity; a "create" item uses
+        # layer/statement/initial_probability/initial_confidence. Every
+        # field but `kind` is nullable so both shapes fit one schema —
+        # nodes.py's Infer._parse_reweight/_parse_create pick which
+        # fields actually apply based on `kind` and ignore the rest.
+        # `evidence_ref`/`turn_id` are deliberately absent: the model
+        # never supplies those (it doesn't know the turn's UUID) —
+        # Infer builds every EvidenceRef itself. See Infer's docstring:
+        # the pre-fix schema had no `kind` at all (reweight-only) and
+        # asked for `evidence_ref` here, which no real response could
+        # ever actually populate.
         "type": "ARRAY",
         "items": {
             "type": "OBJECT",
             "properties": {
-                "hypothesis_id": {"type": "STRING"},
-                "new_probability": {"type": "NUMBER"},
-                "new_confidence": {"type": "NUMBER"},
+                "kind": {"type": "STRING", "enum": ["reweight", "create"]},
+                "hypothesis_id": {"type": "STRING", "nullable": True},
+                "new_probability": {"type": "NUMBER", "nullable": True},
+                "new_confidence": {"type": "NUMBER", "nullable": True},
                 "polarity": {
                     "type": "STRING",
                     "enum": ["supporting", "contradicting"],
+                    "nullable": True,
                 },
+                "layer": {
+                    "type": "STRING",
+                    "enum": ["goal", "knowledge", "mental_model", "cognitive_state", "teaching"],
+                    "nullable": True,
+                },
+                "statement": {"type": "STRING", "nullable": True},
+                "initial_probability": {"type": "NUMBER", "nullable": True},
+                "initial_confidence": {"type": "NUMBER", "nullable": True},
             },
-            "required": ["hypothesis_id", "new_probability", "new_confidence"],
+            "required": ["kind"],
         },
     },
     "PROPOSE:ACTIONS": {
@@ -300,6 +342,22 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
         },
         "required": ["confidence"],
     },
+    "EXTRACT:REQUEST": {
+        "type": "OBJECT",
+        "properties": {
+            "present": {"type": "BOOLEAN"},
+            "what": {"type": "STRING", "nullable": True},
+        },
+        "required": ["present"],
+    },
+    "EXTRACT:ARTIFACT": {
+        "type": "OBJECT",
+        "properties": {
+            "example": {"type": "STRING", "nullable": True},
+            "analogy": {"type": "STRING", "nullable": True},
+        },
+        "required": [],
+    },
     "SCORE:LEARNING_VALUE": _NUMBER_SCHEMA,
     "SCORE:COGNITIVE_COST": _NUMBER_SCHEMA,
     "SCORE:FRUSTRATION_RISK": _NUMBER_SCHEMA,
@@ -316,6 +374,16 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
     },
     "SCORE:INFO_UPDATE": _JSON_ONLY,
     "TEACH:": _FREE_TEXT,
+    # BaselineTeach's output is likewise shown straight to the student,
+    # not parsed downstream — same reasoning as TEACH:. Without this
+    # entry, an unrecognized prefix falls through to this function's own
+    # JSON-mode default (see its docstring), which forces
+    # response_mime_type=application/json at the API level regardless
+    # of what the prompt itself asks for — no amount of "respond with
+    # plain prose" prompt text can override that. Confirmed live: this
+    # was the actual cause of BASELINE wrapping its answer in
+    # `{"response": "..."}` even after that instruction was added.
+    "BASELINE:TEACH": _FREE_TEXT,
     "GENERATE:INTENT": {
         "type": "ARRAY",
         "items": {
@@ -399,6 +467,38 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
         "properties": {"topic": {"type": "STRING"}},
         "required": ["topic"],
     },
+    "ASSESS:BRANCH": {
+        "type": "OBJECT",
+        "properties": {
+            "needs_branches": {"type": "BOOLEAN"},
+            "branches": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {"statement": {"type": "STRING"}},
+                    "required": ["statement"],
+                },
+            },
+        },
+        "required": ["needs_branches"],
+    },
+    "DISAMBIGUATE:OPTIONS": {
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "branch_id": {"type": "STRING"},
+                "text": {"type": "STRING"},
+            },
+            "required": ["branch_id", "text"],
+        },
+    },
+    # FinalAnswer's output is shown straight to the student, same
+    # reasoning as TEACH:/BASELINE:TEACH — no JSON mode, or Gemini
+    # would force response_mime_type=application/json regardless of
+    # what the prompt itself asks for (see BASELINE:TEACH's own
+    # comment for the live failure this was confirmed to cause).
+    "FINAL:ANSWER": _FREE_TEXT,
 }
 
 

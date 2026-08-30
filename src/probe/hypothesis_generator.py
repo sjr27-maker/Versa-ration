@@ -37,6 +37,7 @@ from probe.models import (
     BranchStatus,
     CandidateAction,
     EvidenceCheckResult,
+    ExplicitRequest,
     Hypothesis,
     OptionProposal,
     PathRequirement,
@@ -328,13 +329,25 @@ def _parse_select_response(
 
 
 def _derive_prompt(
-    path: list[Branch], student_message: str, action_rationale: str
+    path: list[Branch],
+    student_message: str,
+    action_rationale: str,
+    explicit_request: ExplicitRequest | None = None,
 ) -> str:
     listing = "\n".join(
         f"- depth={b.depth} [{b.depth_label}]: {b.statement} "
         f"(predicted future reaction, NOT YET SAID: {b.predicted_next_turn})"
         for b in path
     )
+    explicit_request_block = ""
+    if explicit_request is not None and explicit_request.present and explicit_request.what:
+        explicit_request_block = (
+            "\nThe student made an explicit, concrete request this turn "
+            f"that scope MUST include, not replace: {explicit_request.what!r}. "
+            "You may add framing around it, but the scope you return "
+            "must still name and resolve this specific request — do "
+            "not substitute a different example or topic.\n"
+        )
     return (
         "DERIVE:PATH\n"
         "Below is the full root-to-leaf path this turn's teaching should "
@@ -344,7 +357,8 @@ def _derive_prompt(
         "The student's actual message, verbatim, is the only thing they "
         f"have actually said so far:\n{student_message}\n\n"
         "The tutor is considering teaching this, but has NOT taught it "
-        f"yet — the student has no knowledge of it: {action_rationale}\n\n"
+        f"yet — the student has no knowledge of it: {action_rationale}\n"
+        f"{explicit_request_block}\n"
         "IMPORTANT — read this carefully before answering. Each "
         "\"predicted future reaction\" above is a HYPOTHETICAL guess "
         "about what the student MIGHT say LATER, after being taught "
@@ -393,6 +407,27 @@ def _parse_path_requirement(raw: str) -> PathRequirement:
         ),
         scope=str(parsed.get("scope") or ""),
     )
+
+
+def _enforce_explicit_request_scope(
+    path_requirement: PathRequirement, explicit_request: ExplicitRequest
+) -> PathRequirement:
+    """Structural backstop, not just a prompt ask: _derive_prompt above
+    already instructs the model to include the explicit request in
+    scope, but prompts drift or get overridden by everything else in
+    the prompt competing for attention — this guarantees it at the
+    code level instead of hoping. Only ever adds to whatever framing
+    DerivePath's own scope already produced; never removes it."""
+    if not explicit_request.what:
+        return path_requirement
+    if explicit_request.what.lower() in path_requirement.scope.lower():
+        return path_requirement
+    combined_scope = (
+        f"{explicit_request.what} — {path_requirement.scope}"
+        if path_requirement.scope
+        else explicit_request.what
+    )
+    return path_requirement.model_copy(update={"scope": combined_scope})
 
 
 def _resolve_prompt(actual_turn_text: str, leaves: list[Branch]) -> str:
@@ -1011,14 +1046,21 @@ class DerivePath:
         self.last_call_count: int = 0
 
     async def run(
-        self, path: list[Branch], student_message: str, action_rationale: str
+        self,
+        path: list[Branch],
+        student_message: str,
+        action_rationale: str,
+        explicit_request: ExplicitRequest | None = None,
     ) -> PathRequirement:
         self.last_call_count = 0
         raw = await self._llm.complete(
-            _derive_prompt(path, student_message, action_rationale)
+            _derive_prompt(path, student_message, action_rationale, explicit_request)
         )
         self.last_call_count += 1
-        return _parse_path_requirement(raw)
+        result = _parse_path_requirement(raw)
+        if explicit_request is not None and explicit_request.present:
+            result = _enforce_explicit_request_scope(result, explicit_request)
+        return result
 
 
 # Words too generic to count as "content" for check_current_belief_leak

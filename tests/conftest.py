@@ -9,6 +9,7 @@ from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
+from probe.disambiguate import DisambiguationStore
 from probe.learner import LearnerStore
 from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
@@ -41,6 +42,9 @@ async def pool():
         await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
         await conn.execute("DROP TABLE IF EXISTS turn_diagnostics CASCADE")
         await conn.execute("DROP TABLE IF EXISTS hypothesis_tier_changes CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS disambiguation_options CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS disambiguation_branches CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS disambiguation_turns CASCADE")
         await conn.execute("DROP TABLE IF EXISTS options CASCADE")
         await conn.execute("DROP TABLE IF EXISTS branches CASCADE")
         await conn.execute("DROP TABLE IF EXISTS branch_generations CASCADE")
@@ -79,7 +83,9 @@ async def clean_pool(pool):
             "turns, sessions, learners, evidence_refs, "
             "hypotheses, learner_overlay, concept_prerequisites, concept_nodes, "
             "concept_graphs, hypothesis_concepts, world_model_revisions, "
-            "world_model_revision_evidence, branches, branch_generations "
+            "world_model_revision_evidence, branches, branch_generations, "
+            "options, disambiguation_options, disambiguation_branches, "
+            "disambiguation_turns "
             "RESTART IDENTITY CASCADE"
         )
     return pool
@@ -128,6 +134,11 @@ async def option_store(clean_pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def diagnostics_store(clean_pool):
     return TurnDiagnosticsStore(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def disambiguation_store(clean_pool):
+    return DisambiguationStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
@@ -27,14 +28,18 @@ from probe.models import (
     ActionScore,
     CandidateAction,
     EvidenceRef,
+    ExplicitRequest,
     Hypothesis,
+    InferOutput,
     Layer,
     PathRequirement,
     PlanOutput,
     Polarity,
     ProposedEvidence,
+    ProposedHypothesis,
     SuggestedCause,
     TeachingAction,
+    TeachingArtifact,
     Tier,
     TopicAttachment,
     WorldModelRevision,
@@ -86,7 +91,44 @@ DIAGNOSE_MISMATCH_THRESHOLD = 0.4
 MAX_CALLS_PER_TURN = 30
 
 
+_LAYER_VALUES = {layer.value for layer in Layer}
+
+
 class Infer:
+    """Decides how this turn's message should change what the loop
+    believes about the student -- the ONLY place in this codebase that
+    creates a new `Hypothesis`, as well as the place that reweights an
+    existing one.
+
+    Before this fix, Infer could only emit reweight-shaped proposals
+    (`ProposedEvidence`, requiring an already-existing `hypothesis_id`)
+    -- there was no path anywhere in production code to mint the FIRST
+    hypothesis for a learner. Since `HypothesisStore.reweight()` raises
+    on a missing id, and `list_by_learner`/`list_by_concept` return
+    only what already exists, every real session (CLI, web UI, every
+    scripted comparison) ran with the hypothesis list permanently
+    empty: `Infer` always received `hypotheses=[]`, always proposed
+    nothing, `compute_reasoning_budget([])` always computed
+    `entropy_bits=0.0`, and every downstream consumer of that (Plan's
+    `generation_width`, `ValueFunction.enable_information_value`,
+    `HypothesisGenerator`'s branch budget) silently ran at its
+    zero-entropy floor forever -- a fully valid-looking result at every
+    single step, which is exactly why nothing ever raised or logged a
+    warning about it.
+
+    The model's own JSON response is decision-only: WHICH existing
+    hypothesis to reweight (or what NEW belief, layer/statement/initial
+    probability+confidence, to create) and to what value. It is never
+    trusted to emit `turn_id` or a full `EvidenceRef` itself -- the
+    model has no way to know the turn's UUID, and the pre-fix schema's
+    `evidence_ref` field could in fact never be populated by a real
+    Gemini response for exactly that reason (confirmed: every existing
+    test that exercised a reweight path had to hand-construct a canned
+    JSON string containing a synthetic `evidence_ref`, something the
+    real structured-output schema never asked the model for). `Infer`
+    itself builds every `EvidenceRef` from the `turn_id` it's given.
+    """
+
     def __init__(self, llm: LLMClient) -> None:
         self._llm = llm
         # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting.
@@ -98,58 +140,197 @@ class Infer:
         self,
         turn_text: str,
         hypotheses: list[Hypothesis],
+        turn_id: UUID,
         generation_width: int = DEFAULT_GENERATION_WIDTH,
-    ) -> list[ProposedEvidence]:
+    ) -> InferOutput:
         self.last_call_count = 0
-        # Real prompt lives in Step 2. For now we ship the plumbing: the
-        # LLM is asked for a JSON list of {hypothesis_id, new_probability,
-        # new_confidence, polarity} objects, and any parse failure yields
-        # an empty proposal set.
-        listing = "\n".join(
-            f"- {h.id} [{h.layer.value}] {h.statement} "
-            f"(p={h.probability:.2f}, c={h.confidence:.2f})"
-            for h in hypotheses
+        listing = (
+            "\n".join(
+                f"- {h.id} [{h.layer.value}] {h.statement} "
+                f"(p={h.probability:.2f}, c={h.confidence:.2f})"
+                for h in hypotheses
+            )
+            if hypotheses
+            else "(none tracked yet for this learner)"
         )
         prompt = (
-            "INFER: given the following student turn, identify which of the "
-            "listed hypotheses it supports or contradicts.\n\n"
+            "INFER: given the following student turn, decide how it should "
+            "change what we believe about this student.\n\n"
             f"Turn: {turn_text}\n\n"
-            f"Hypotheses:\n{listing}\n"
+            f"Existing tracked hypotheses:\n{listing}\n\n"
+            'For each existing hypothesis this turn clearly supports or '
+            'contradicts, emit a reweight item: {"kind": "reweight", '
+            '"hypothesis_id": "<id from the list above>", '
+            '"new_probability": 0.0-1.0, "new_confidence": 0.0-1.0, '
+            '"polarity": "supporting" or "contradicting"}.\n'
+            "If the turn reveals something worth tracking about the "
+            "student that is NOT already covered by any hypothesis "
+            "above -- a goal, a piece of knowledge, a mental model, a "
+            "cognitive-state observation, or a teaching-relevant fact "
+            "-- emit a create item instead: "
+            '{"kind": "create", "layer": one of '
+            f"{sorted(_LAYER_VALUES)}, "
+            '"statement": "the belief, stated about the student", '
+            '"initial_probability": 0.0-1.0, "initial_confidence": '
+            "0.0-1.0}. Do not create a hypothesis that only restates one "
+            "already in the list above.\n"
+            "If nothing in the turn bears on any existing hypothesis and "
+            "nothing new is worth tracking, return an empty list. Return "
+            "a JSON array of these items, nothing else."
         )
         raw = await self._llm.complete(prompt)
         self.last_call_count += 1
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            return []
+            return InferOutput()
         if not isinstance(parsed, list):
-            return []
+            return InferOutput()
+
         valid_ids = {h.id for h in hypotheses}
-        proposals: list[ProposedEvidence] = []
+        reweights: list[ProposedEvidence] = []
+        creates: list[ProposedHypothesis] = []
         for item in parsed:
-            try:
-                proposal = ProposedEvidence.model_validate(item)
-            except Exception:
+            if not isinstance(item, dict):
                 continue
-            if proposal.hypothesis_id not in valid_ids:
-                # Same validation discipline as GroundConcept/Plan:
-                # reject a reference outside the candidate set shown
-                # this turn rather than pass it through. Not just
-                # cosmetic — `hypotheses` is now learner-scoped
-                # (SessionLoop), so this is what actually stops a
-                # hallucinated or copied id from reweighting a
-                # *different* learner's hypothesis; the caller can't
-                # rely on the LLM simply never seeing one.
-                logger.warning(
-                    "Infer: proposal referenced hypothesis_id %s, not in "
-                    "the %d candidates shown this turn — rejected rather "
-                    "than reweighted",
-                    proposal.hypothesis_id,
-                    len(hypotheses),
-                )
-                continue
-            proposals.append(proposal)
-        return proposals
+            kind = item.get("kind")
+            if kind == "reweight":
+                reweight = self._parse_reweight(item, valid_ids, turn_id, len(hypotheses))
+                if reweight is not None:
+                    reweights.append(reweight)
+            elif kind == "create":
+                create = self._parse_create(item, turn_id)
+                if create is not None:
+                    creates.append(create)
+            # Any other/missing `kind` is silently dropped, same
+            # "malformed model output never crashes the turn"
+            # discipline as every other parse-and-validate node.
+        return InferOutput(reweights=reweights, creates=creates)
+
+    def _parse_reweight(
+        self, item: dict, valid_ids: set[UUID], turn_id: UUID, n_candidates: int
+    ) -> ProposedEvidence | None:
+        try:
+            hypothesis_id = UUID(str(item["hypothesis_id"]))
+            polarity = Polarity(item.get("polarity", Polarity.SUPPORTING.value))
+        except (KeyError, ValueError, TypeError):
+            return None
+        if hypothesis_id not in valid_ids:
+            # Same validation discipline as GroundConcept/Plan: reject
+            # a reference outside the candidate set shown this turn
+            # rather than pass it through. Not just cosmetic —
+            # `hypotheses` is learner-scoped (SessionLoop), so this is
+            # what actually stops a hallucinated or copied id from
+            # reweighting a *different* learner's hypothesis; the
+            # caller can't rely on the LLM simply never seeing one.
+            logger.warning(
+                "Infer: reweight referenced hypothesis_id %s, not in "
+                "the %d candidates shown this turn — rejected rather "
+                "than reweighted",
+                hypothesis_id,
+                n_candidates,
+            )
+            return None
+        try:
+            return ProposedEvidence(
+                hypothesis_id=hypothesis_id,
+                new_probability=item["new_probability"],
+                new_confidence=item["new_confidence"],
+                evidence_ref=EvidenceRef(turn_id=turn_id, polarity=polarity),
+            )
+        except Exception:
+            return None
+
+    def _parse_create(self, item: dict, turn_id: UUID) -> ProposedHypothesis | None:
+        layer_raw = item.get("layer")
+        if layer_raw not in _LAYER_VALUES:
+            return None
+        statement = item.get("statement")
+        if not isinstance(statement, str) or not statement.strip():
+            return None
+        try:
+            return ProposedHypothesis(
+                layer=Layer(layer_raw),
+                statement=statement.strip(),
+                initial_probability=item["initial_probability"],
+                initial_confidence=item["initial_confidence"],
+                # A brand-new hypothesis has nothing yet to contradict —
+                # always SUPPORTING, never read from the model's own
+                # output (see class docstring: the model decides WHAT,
+                # not the evidence bookkeeping).
+                evidence_ref=EvidenceRef(turn_id=turn_id, polarity=Polarity.SUPPORTING),
+            )
+        except Exception:
+            return None
+
+
+def _parse_explicit_request(raw: str) -> ExplicitRequest:
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return ExplicitRequest(present=False, what=None)
+    if not isinstance(parsed, dict):
+        return ExplicitRequest(present=False, what=None)
+    what = parsed.get("what")
+    if not parsed.get("present") or not isinstance(what, str) or not what.strip():
+        # No partial-request state (see ExplicitRequest's docstring):
+        # a falsy `present`, or a `present=true` with no usable `what`,
+        # both collapse to the same "nothing to prioritize" outcome.
+        return ExplicitRequest(present=False, what=None)
+    return ExplicitRequest(present=True, what=what.strip())
+
+
+class ExtractRequest:
+    """Runs before Plan, every turn: does the student's message contain
+    a concrete, answerable request -- a specific function, problem,
+    example, or question with a definite thing to produce -- as
+    opposed to an open-ended or exploratory one?
+
+    A dedicated node rather than folded into Diagnose or Infer: this
+    is not a belief judgment (Diagnose's job) or evidence about a
+    hypothesis (Infer's job) -- it's a narrower, structural fact about
+    the turn's own text, decoupled from both. Giving it its own
+    node_calls row is also what lets Plan/DerivePath/Teach's downstream
+    use of it (see loop.py) be audited independently of those other
+    concerns, and what lets turn_diagnostics persist it directly for
+    the web UI rather than the UI re-deriving it from a Plan or Teach
+    row it doesn't otherwise need.
+
+    When `present`, `what` takes precedence over Plan's chosen
+    target_concept and DerivePath's scope: the pedagogical machinery
+    decides HOW to teach, never WHETHER to answer what was actually
+    asked -- see this module's `check_explicit_request_unaddressed`,
+    the post-Teach backstop for when that precedence gets lost anyway.
+
+    Fast tier: fires every turn, same tier as GroundConcept/
+    MismatchDetector/Infer.
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting.
+        self.last_call_count: int = 0
+
+    async def run(self, turn_text: str) -> ExplicitRequest:
+        self.last_call_count = 0
+        prompt = (
+            "EXTRACT:REQUEST\n"
+            "Does this student message contain a concrete, answerable "
+            "request -- a specific function, problem, example, or "
+            'question that has a definite thing to produce (e.g. "show '
+            'me with sin(x^2)", "what\'s the derivative of 3x^2", "can '
+            'you factor x^2-4")? An open-ended or exploratory message '
+            '("what is a derivative", "tell me more", "I don\'t get '
+            'it") does NOT count -- only a message with a specific, '
+            "nameable thing to work out counts.\n\n"
+            f"message: {turn_text}\n\n"
+            'Respond with JSON: {"present": true or false, "what": '
+            '"the specific request, in the student\'s own terms" or '
+            "null}"
+        )
+        raw = await self._llm.complete(prompt)
+        self.last_call_count += 1
+        return _parse_explicit_request(raw)
 
 
 class Plan:
@@ -184,6 +365,7 @@ class Plan:
         concept_state: dict,
         generation_width: int,
         exploration_target: Hypothesis | None = None,
+        explicit_request: ExplicitRequest | None = None,
     ) -> PlanOutput:
         if exploration_target is None:
             logger.info(
@@ -193,7 +375,8 @@ class Plan:
                 generation_width,
             )
         candidates = await self._generate(
-            hypotheses, concept_state, generation_width, exploration_target
+            hypotheses, concept_state, generation_width, exploration_target,
+            explicit_request,
         )
         # Candidates are independent of each other — scored concurrently.
         # asyncio.gather preserves input order, so `scores` still lines
@@ -228,6 +411,7 @@ class Plan:
         concept_state: dict,
         generation_width: int,
         exploration_target: Hypothesis | None,
+        explicit_request: ExplicitRequest | None = None,
     ) -> list[CandidateAction]:
         """Ask the LLM for `generation_width` distinct plausible actions.
 
@@ -246,7 +430,8 @@ class Plan:
         for _ in range(_MAX_PROPOSE_ATTEMPTS):
             raw = await self._llm.complete(
                 _propose_prompt(
-                    hypotheses, concept_state, width, rejected, exploration_target
+                    hypotheses, concept_state, width, rejected, exploration_target,
+                    explicit_request,
                 )
             )
             self.last_generate_call_count += 1
@@ -301,6 +486,7 @@ def _propose_prompt(
     width: int,
     rejected: list[str],
     exploration_target: Hypothesis | None = None,
+    explicit_request: ExplicitRequest | None = None,
 ) -> str:
     # Same belief set the value function scores against (ValueFunction.score
     # filters to ACTIVE too), so proposer and scorer never disagree about
@@ -341,6 +527,18 @@ def _propose_prompt(
             "purely motivational or clarifying action) — never invent "
             "an id that isn't in that list.\n"
         )
+    explicit_request_instruction = ""
+    if explicit_request is not None and explicit_request.present and explicit_request.what:
+        explicit_request_instruction = (
+            "\nThe student made an explicit, concrete request this turn "
+            f"that MUST be answered, not substituted: {explicit_request.what!r}. "
+            "Every candidate you propose must serve THIS request "
+            "directly — choose an action and target_concept such that "
+            "teaching it means actually resolving what was asked, not a "
+            "different example or a related-but-different topic. You "
+            "decide HOW to answer it (which action, which framing), "
+            "never whether to.\n"
+        )
     return (
         "PROPOSE:ACTIONS\n"
         f"Propose exactly {width} distinct teaching actions worth scoring "
@@ -352,6 +550,7 @@ def _propose_prompt(
         f"{correction}"
         f"{exploration_instruction}"
         f"{concept_instruction}"
+        f"{explicit_request_instruction}"
         'Respond with JSON: [{"action": "...", "target_concept": "..." or null, '
         '"rationale": "one short sentence"}, ...]'
     )
@@ -456,6 +655,9 @@ class Teach:
         student_message: str,
         path_requirement: PathRequirement | None = None,
         options: list[str] | None = None,
+        explicit_request: ExplicitRequest | None = None,
+        recent_history: str = "",
+        examples_used: str = "",
     ) -> str:
         """Teach no longer receives the branch tree or a bare topic
         string — a tree invites free association, a path constrains.
@@ -471,7 +673,32 @@ class Teach:
         lead into, not the underlying bookkeeping) are rendered as
         buttons by the UI below this response, not restated in it. The
         instruction below is about how the response *ends*, not what
-        it contains."""
+        it contains.
+
+        `explicit_request` (ExtractRequest's output) is stated
+        separately from `path_requirement`, deliberately: it is a
+        MUST-ANSWER instruction, not scoping guidance — path_requirement
+        says how to frame the turn, explicit_request says what has to
+        actually get resolved inside it regardless of that framing. See
+        `check_explicit_request_unaddressed` for the post-hoc backstop
+        when this instruction gets ignored anyway.
+
+        `recent_history` (loop.py's `_build_teach_history` — the last
+        few student turns plus Teach's own last few responses, read
+        back out of node_calls, NOT the full transcript_context
+        HypothesisGenerator uses) exists so Teach can notice it already
+        answered something, already stated a constraint, or already
+        used a given framing, instead of contradicting or ignoring its
+        own recent work.
+
+        `examples_used` (loop.py's `_build_examples_used`, backed by
+        ExtractTeachingArtifact's own node_calls) is the structured
+        record of concrete examples/analogies already used this
+        session — reuse or build on one of these before reaching for a
+        new one. See `check_prior_reference_unaddressed` for the
+        post-hoc backstop for when the student references something
+        from here by name and Teach doesn't.
+        """
         self.last_call_count = 0
         focus = (
             f"Focus specifically on the concept {action.target_concept!r}."
@@ -532,6 +759,43 @@ class Teach:
                 "to avoid. The close is about what happens next in the "
                 "material, not about the student.\n"
             )
+        explicit_request_block = ""
+        if explicit_request is not None and explicit_request.present and explicit_request.what:
+            explicit_request_block = (
+                "\nThe student made an explicit, concrete request this "
+                "turn that you MUST fully answer within this response: "
+                f"{explicit_request.what}\n"
+                "Work it through to its actual result — the named "
+                "function, problem, or question must be resolved here, "
+                "not merely referenced. Deferring it (\"we can apply "
+                "this to X next\", \"let's explore this later\", "
+                "\"would you like to see...\") is a failure, not a "
+                "valid pedagogical choice. You may still use the "
+                "guidance above to frame HOW you answer it, but the "
+                "request itself must be answered now, not promised.\n"
+            )
+        history_block = ""
+        if recent_history:
+            history_block = (
+                "\nRecent conversation, for continuity only (do not "
+                "repeat this back or restate it — use it to avoid "
+                "contradicting or ignoring what you just said):\n"
+                f"{recent_history}\n"
+            )
+        examples_block = ""
+        if examples_used:
+            examples_block = (
+                "\nConcrete examples/analogies already used this "
+                f"session:\n{examples_used}\n"
+                "Prefer reusing or explicitly building on one of these "
+                "over introducing a new one when a prior one still "
+                "applies. If the student's message refers to something "
+                "from earlier (\"the example you just gave\", \"going "
+                "back to X\", \"does that still apply to...\"), you "
+                "MUST name and use that specific thing here — do not "
+                "restate it generically or replace it with a new "
+                "framing or a different analogy.\n"
+            )
         prompt = (
             "TEACH: "
             + json.dumps(
@@ -543,6 +807,9 @@ class Teach:
                 }
             )
             + (f"\n{focus}" if focus else "")
+            + explicit_request_block
+            + history_block
+            + examples_block
             + path_block
             + options_block
             + "\nDo not introduce specific values, signs, conditions, or "
@@ -558,6 +825,279 @@ class Teach:
             "internal state (e.g. never say something is \"unspecified\", "
             "\"null\", or refer to target_concept/action/rationale by "
             "name) — just teach, as if you already knew what to say."
+        )
+        result = await self._llm.complete(prompt)
+        self.last_call_count += 1
+        return result
+
+
+class ExtractTeachingArtifact:
+    """Runs once, right after Teach succeeds each turn: pulls out the
+    concrete function/problem actually worked (if any) and the analogy
+    or metaphor used to explain a concept (if any), as short structured
+    phrases.
+
+    Teach's rendered text is already the durable record (node_calls
+    already has it verbatim, per CLAUDE.md invariant 2) — this node
+    exists because "was an analogy like this already used" is far
+    cheaper and more reliable to check against two short structured
+    fields than by re-reading full rendered prose covered in LaTeX
+    every turn. Its own node_calls rows, read back via
+    NodeCallStore.get_recent_calls, are what loop.py's
+    `_build_examples_used` turns into Teach's "already used" list and
+    what `check_prior_reference_unaddressed` checks a backward
+    reference against.
+
+    Fast tier, same reasoning as ExtractRequest: a narrow, structural
+    fact about text that already exists, not a judgment call.
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting.
+        self.last_call_count: int = 0
+
+    async def run(self, teach_output: str) -> TeachingArtifact:
+        self.last_call_count = 0
+        prompt = (
+            "EXTRACT:ARTIFACT\n"
+            "From this tutor response, identify two things if present:\n"
+            "1. The concrete function or problem actually worked (e.g. "
+            '"sin(x^2)", "(3x+1)^5") -- not the general topic, the '
+            "specific expression.\n"
+            "2. Any analogy or metaphor used to explain a concept (e.g. "
+            '"nested Russian dolls", "gears turning inside each '
+            'other").\n\n'
+            f"tutor response: {teach_output}\n\n"
+            'Respond with JSON: {"example": "short phrase" or null, '
+            '"analogy": "short phrase" or null}. Most responses have '
+            "at most one of each -- use null for whichever is absent."
+        )
+        raw = await self._llm.complete(prompt)
+        self.last_call_count += 1
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return TeachingArtifact(example=None, analogy=None)
+        if not isinstance(parsed, dict):
+            return TeachingArtifact(example=None, analogy=None)
+        example = parsed.get("example")
+        analogy = parsed.get("analogy")
+        return TeachingArtifact(
+            example=example.strip() if isinstance(example, str) and example.strip() else None,
+            analogy=analogy.strip() if isinstance(analogy, str) and analogy.strip() else None,
+        )
+
+
+# Phrases that read as putting a task off rather than doing it now.
+# Deliberately generic (not tied to any one subject/domain) since an
+# explicit request can be about anything from a math function to a
+# code example — the tell is the deferral language, not the topic.
+_DEFERRAL_PHRASES = (
+    "we can", "we could", "we'll", "we will", "let's", "let us",
+    "you can", "next time", "next turn", "in the future", "later",
+    "would you like", "moving forward", "going forward", "afterward",
+    "if you'd like", "if you want", "if you'd prefer",
+)
+
+# Same discipline as hypothesis_generator._BELIEF_CHECK_STOPWORDS: words
+# too generic to count as "the request's own content" — without
+# filtering these, almost any sentence would share enough of them with
+# the request text to look like a match. Generic task verbs (compute,
+# differentiate, solve...) get filtered alongside ordinary stopwords,
+# not just connector words: "differentiate sin(x^2)" and "differentiate
+# 3x^2" share the verb but ask about different objects, so the verb
+# must not be what makes a sentence count as "addressing the request" —
+# only the named object should.
+_REQUEST_CHECK_STOPWORDS = frozenset(
+    {
+        "the", "and", "with", "for", "this", "that", "show", "example",
+        "can", "you", "what", "how", "does", "using", "use", "let",
+        "are", "is", "of", "to", "in", "on", "at", "me", "an", "as",
+        "it", "your", "would", "please", "give", "tell", "about",
+        "differentiate", "derive", "derivative", "calculate", "compute",
+        "find", "solve", "determine", "evaluate", "simplify", "factor",
+        "integrate", "expand", "demonstrate", "explain", "prove",
+        "verify", "work", "out", "walk", "through",
+    }
+)
+
+
+def _request_content_words(text: str) -> set[str]:
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return {w for w in words if len(w) > 1 and w not in _REQUEST_CHECK_STOPWORDS}
+
+
+def check_explicit_request_unaddressed(explicit_request_what: str, teach_output: str) -> bool:
+    """A structural backstop for Teach's own must-answer instruction,
+    same spirit as `hypothesis_generator.check_current_belief_leak`: a
+    word-overlap heuristic, not semantic understanding, that flags a
+    pattern worth a human's attention in turn_diagnostics rather than
+    proving the request went unanswered.
+
+    True when either (a) none of the request's distinctive terms
+    appear anywhere in the output at all, or (b) every sentence that
+    does mention them also reads as a deferral ("we can look at this
+    next") rather than a worked answer — the exact failure this check
+    was written after: Plan substituting a different example and Teach
+    writing "we can apply this to sin(x^2)" without ever computing it.
+    A sentence that mentions the request WITHOUT deferral language is
+    treated as evidence it was actually addressed, even if a *different*
+    sentence elsewhere also happens to defer — one worked answer is
+    enough, regardless of how many hedges surround it.
+    """
+    request_words = _request_content_words(explicit_request_what)
+    if not request_words:
+        return False  # nothing distinctive enough in the request to check against
+
+    output_lower = teach_output.lower()
+    if not any(word in output_lower for word in request_words):
+        return True  # never even mentioned
+
+    sentences = re.split(r"(?<=[.!?])\s+", teach_output)
+    mentioning_sentences = [
+        s for s in sentences if any(word in s.lower() for word in request_words)
+    ]
+    if not mentioning_sentences:
+        return True  # matched at the word-soup level but not within any real sentence
+    return all(
+        any(phrase in s.lower() for phrase in _DEFERRAL_PHRASES)
+        for s in mentioning_sentences
+    )
+
+
+# Phrases that plausibly point back at something already established
+# this session, rather than raising a new topic. Deliberately generic
+# (not tied to any one subject/domain), the same discipline as
+# _DEFERRAL_PHRASES -- the tell is the backward-pointing language, not
+# the topic. "you just gave"/"you gave" cover the exact observed live
+# failure: "does that still apply to the chain rule example you just
+# gave?"
+_REFERENCE_PHRASES = (
+    "you just gave", "you gave", "you just showed", "you showed",
+    "you just said", "you said", "earlier you", "you mentioned",
+    "going back to", "back to the", "the example you", "that example",
+    "the one you", "we talked about", "still applies to",
+    "does that still apply", "the analogy you", "like you said",
+    "as you mentioned", "you just did", "you just used",
+)
+
+
+def detect_prior_reference(student_message: str) -> bool:
+    """Heuristic, phrase-based -- same discipline as `_DEFERRAL_PHRASES`:
+    flags when the student's message plausibly points back at
+    something already established (a prior example, analogy, or
+    explanation), without attempting to understand what specifically.
+    Gates whether `check_prior_reference_unaddressed` is even
+    meaningful this turn."""
+    lower = student_message.lower()
+    return any(phrase in lower for phrase in _REFERENCE_PHRASES)
+
+
+def check_prior_reference_unaddressed(
+    last_artifact: TeachingArtifact | None, teach_output: str
+) -> bool:
+    """A structural backstop for Teach's own recent-history/
+    examples_used prompt blocks, same spirit as
+    `check_explicit_request_unaddressed`: a word-overlap heuristic, not
+    semantic understanding, that flags a pattern worth a human's
+    attention in turn_diagnostics rather than proving the reference was
+    actually missed.
+
+    `last_artifact` is the example/analogy tracked from the
+    immediately preceding turn's ExtractTeachingArtifact call (see
+    loop.py's `_build_examples_used`) -- "you just gave" can only ever
+    mean the turn right before this one. Checked per field, not pooled:
+    if the tracked turn had an example, that example's distinctive
+    terms must appear somewhere in `teach_output`; separately, if it
+    had an analogy, that analogy's terms must appear too. Flags True
+    the moment either tracked field goes missing -- reusing one while
+    silently dropping the other is still the failure this exists to
+    catch, live-observed after the fix first shipped: turn 4 kept the
+    "nested dolls" analogy language but swapped in a brand-new function,
+    (3x+1)^5, instead of continuing with sin(x^2), the actual thing "the
+    chain rule example you just gave" referred to -- a pooled check
+    would have (and initially did) wave this through as "addressed"
+    because the analogy words alone were present.
+
+    Returns False (nothing to check) when there is no tracked artifact
+    from the immediately preceding turn at all, or it tracked neither
+    an example nor an analogy -- a student can reference something
+    this mechanism has no record of (a turn before this feature
+    existed, or a purely conversational aside), which is not evidence
+    of a new failure.
+    """
+    if last_artifact is None:
+        return False
+    if last_artifact.example is None and last_artifact.analogy is None:
+        return False
+    output_lower = teach_output.lower()
+    for field in (last_artifact.example, last_artifact.analogy):
+        if not field:
+            continue
+        field_words = _request_content_words(field)
+        if field_words and not any(word in output_lower for word in field_words):
+            return True
+    return False
+
+
+class BaselineTeach:
+    """The true plain-LLM baseline (AblationConfig.is_full_bypass, see
+    loop.py's `_handle_bypass_turn`): one call, no hypotheses, no
+    concept graph, no plan, no branches -- just the student's message
+    plus this session's prior turns as context. This is the number
+    every other layer is measured against, so it deliberately does not
+    reuse `Teach`'s architecture-specific scaffolding (target_concept
+    framing, PathRequirement blocks, options blocks) -- those exist to
+    carry information (a planned action, a derived path) this baseline
+    never has.
+
+    It DOES reuse Teach's plain output-shape instructions (no JSON
+    wrapper, no headers/step-partitioning unless the content needs it,
+    never close by asking how the student feels or what they prefer):
+    those are prompt-writing hygiene, not architecture, and withholding
+    them would confound the comparison this node exists to make honest
+    -- a baseline that loses to the full system only because nobody
+    told it not to leak JSON is not evidence any *layer* is doing
+    something, just evidence of an unfair prompt.
+    """
+
+    def __init__(self, llm: LLMClient) -> None:
+        self._llm = llm
+        # Read by SessionLoop into the MAX_CALLS_PER_TURN accounting,
+        # same convention as every other node.
+        self.last_call_count: int = 0
+
+    async def run(self, turn_text: str, prior_turns: list[str]) -> str:
+        self.last_call_count = 0
+        history = (
+            "\n".join(f"student: {t}" for t in prior_turns)
+            if prior_turns
+            else "(no prior turns)"
+        )
+        prompt = (
+            # The "BASELINE:TEACH" prefix matters, not just for
+            # logging: llm.py's GeminiLLMClient dispatches structured-
+            # output config by longest matching prefix, and an
+            # unrecognized prefix defaults to forcing
+            # response_mime_type=application/json at the API level —
+            # no prompt text can override that after the fact. TEACH:
+            # is registered free-text for the same reason; this prefix
+            # must be too.
+            "BASELINE:TEACH\n"
+            "You are a tutor having a conversation with a student. "
+            "Respond directly and helpfully to their latest message.\n\n"
+            f"Prior turns in this conversation:\n{history}\n\n"
+            f"Student's latest message: {turn_text}\n\n"
+            "Lead with the direct answer or key idea — do not open "
+            "with setup or a restatement of the question. Do not "
+            "partition the response into steps or add headers/numbered "
+            "lists unless the content genuinely requires that "
+            "structure.\n"
+            "Never end by asking how the student feels, what they "
+            "prefer, or what kind of learner they are.\n"
+            "Respond with plain prose only — never wrap your answer in "
+            "JSON or any other structured/markup format."
         )
         result = await self._llm.complete(prompt)
         self.last_call_count += 1
@@ -651,7 +1191,28 @@ class Diagnose:
         expectation: str,
         session_id: UUID,
         turn_id: UUID,
+        enable_grounding: bool = True,
+        enable_mismatch: bool = True,
+        enable_hypotheses: bool = True,
     ) -> dict:
+        """`enable_grounding`/`enable_mismatch`/`enable_hypotheses` are
+        AblationConfig's `enable_concept_graph`/`enable_diagnose`/
+        `enable_portrait` respectively (see loop.py's call site) — all
+        default True so every existing caller that doesn't pass them
+        gets exactly today's behavior.
+
+        `enable_grounding=False` skips GroundConcept entirely (no
+        concept to ground against, no LearnerOverlay read) and returns
+        immediately — the "no grounding" half of disabling the concept
+        graph. `enable_mismatch=False` still grounds (concept grounding
+        is a separate concern from mismatch detection) but returns
+        right after, before MismatchDetector, ConceptGraph.get_concept,
+        or LearnerOverlay are ever touched. `enable_hypotheses=False`
+        passes an empty hypothesis list into MismatchDetector instead
+        of reading HypothesisStore.list_by_concept — the LEARNER_MISCONCEPTION
+        branch below then naturally reweights nothing, since its loop is
+        over that same (now empty) list; no separate guard needed there.
+        """
         result: dict[str, Any] = {
             "classification": "unknown",
             "matched_expectation": False,
@@ -672,6 +1233,14 @@ class Diagnose:
             "llm_call_count": 0,
         }
 
+        if not enable_grounding:
+            result["notes"] += (
+                "; concept grounding disabled "
+                "(AblationConfig.enable_concept_graph=False) — skipped "
+                "grounding and mismatch check entirely"
+            )
+            return result
+
         learner_id = await self._transcript.get_learner_id(session_id)
         concept_graph_id = await self._transcript.get_concept_graph_id(session_id)
 
@@ -691,6 +1260,14 @@ class Diagnose:
             return result
         concept_id = grounding.concept_id
 
+        if not enable_mismatch:
+            result["notes"] += (
+                "; mismatch/revision detection disabled "
+                "(AblationConfig.enable_diagnose=False) — grounded but "
+                "skipped MismatchDetector"
+            )
+            return result
+
         concept = await self._concepts.get_concept(concept_graph_id, concept_id)
         if concept is None:
             result["notes"] += (
@@ -701,8 +1278,12 @@ class Diagnose:
         overlay_entry = await self._overlay.get_state(
             learner_id, concept_graph_id, concept_id
         )
-        hypotheses = await self._hyp.list_by_concept(
-            concept_graph_id, concept_id, layer=Layer.MENTAL_MODEL, tier=Tier.ACTIVE
+        hypotheses = (
+            await self._hyp.list_by_concept(
+                concept_graph_id, concept_id, layer=Layer.MENTAL_MODEL, tier=Tier.ACTIVE
+            )
+            if enable_hypotheses
+            else []
         )
 
         mismatch = await self._detector.detect(
@@ -735,6 +1316,29 @@ class Diagnose:
             result["action_taken"] = "revision_proposed"
             result["revision_id"] = str(revision.id)
         elif mismatch.suggested_cause is SuggestedCause.LEARNER_MISCONCEPTION:
+            # Reweight-only, by deliberate decision, not an oversight
+            # left alongside Infer's fix: hypothesis creation stays
+            # Infer/Update's sole responsibility. Two independent code
+            # paths both minting MENTAL_MODEL hypotheses for the same
+            # concept -- this one keyed off a concept-graph mismatch,
+            # Infer's off free-text signal in the turn -- would risk
+            # duplicate/near-duplicate hypotheses about the same belief
+            # with no reconciliation between them. Infer already runs
+            # every turn and is the one place already responsible for
+            # "does this turn suggest a new belief worth tracking";
+            # narrowing that decision to a single call path keeps
+            # HypothesisStore's population inspectable from one place.
+            #
+            # Residual, narrower gap left open by this decision (not
+            # fixed here): if `hypotheses` is empty -- no MENTAL_MODEL/
+            # ACTIVE hypothesis yet exists for this concept -- a
+            # LEARNER_MISCONCEPTION mismatch reweights nothing and
+            # `action_taken` stays "none"; the raw `mismatch` fields
+            # are still recorded on this turn's result, so the signal
+            # isn't invisible, just not durably tracked as a hypothesis
+            # yet. That's a smaller, separate gap for Infer's own
+            # create path to eventually pick up on a later turn, not
+            # something this fix silently papers over.
             reweighted_ids: list[str] = []
             for hyp in hypotheses:
                 evidence_ref = EvidenceRef(
@@ -761,13 +1365,20 @@ class Diagnose:
 
 
 class Update:
+    """Applies Infer's decisions to `HypothesisStore` — the literal
+    missing link before this fix: `Infer` could decide a new belief was
+    worth tracking, but nothing ever called `HypothesisStore.add()` to
+    make it real. `reweight()` for existing hypotheses is unchanged;
+    `add()` for `InferOutput.creates` is additive, not a replacement.
+    """
+
     async def run(
         self,
-        proposals: list[ProposedEvidence],
+        proposals: InferOutput,
         hypothesis_store: HypothesisStore,
     ) -> list[EvidenceRef]:
         applied: list[EvidenceRef] = []
-        for prop in proposals:
+        for prop in proposals.reweights:
             await hypothesis_store.reweight(
                 prop.hypothesis_id,
                 prop.new_probability,
@@ -775,6 +1386,25 @@ class Update:
                 prop.evidence_ref,
             )
             applied.append(prop.evidence_ref)
+        for create in proposals.creates:
+            # tier=ACTIVE, not DORMANT/BACKGROUND: a hypothesis Infer
+            # just decided is worth tracking from this turn's evidence
+            # needs to be visible to THIS turn's still-to-run Replan
+            # call (see SessionLoop.handle_turn's refreshed_hypotheses
+            # read right after Update) — starting it anywhere entropy
+            # computation ignores would silently reproduce the exact
+            # bug this fix exists to close.
+            await hypothesis_store.add(
+                Hypothesis(
+                    layer=create.layer,
+                    statement=create.statement,
+                    probability=create.initial_probability,
+                    confidence=create.initial_confidence,
+                    tier=Tier.ACTIVE,
+                    evidence_refs=[create.evidence_ref],
+                )
+            )
+            applied.append(create.evidence_ref)
         return applied
 
 

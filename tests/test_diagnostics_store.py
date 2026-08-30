@@ -78,6 +78,12 @@ async def test_every_field_roundtrips_write_to_read(
         retry_count=3,
         options_missed=True,
         current_belief_unsupported=True,
+        generation_skipped_reason="turn 0 has no accumulated evidence yet",
+        explicit_request_present=True,
+        explicit_request_what="differentiate sin(x^2)",
+        explicit_request_unaddressed=True,
+        prior_reference_detected=True,
+        prior_reference_unaddressed=True,
     )
     await store.record(diagnostics)
 

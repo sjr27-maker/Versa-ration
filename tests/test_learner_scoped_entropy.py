@@ -186,21 +186,16 @@ async def test_a_learners_turn_can_never_reweight_another_learners_hypothesis(
         EvidenceRef(turn_id=seed_turn_b, polarity=Polarity.SUPPORTING),
     )
 
-    # A real turn in learner_a's own session, for the crafted evidence_ref.
-    seed_turn_a = await transcript.record_turn(session_a, 0, "learner a's own turn")
-
     # Adversarial (or simply hallucinated) Infer response: targets
     # learner_b's real hypothesis_id from inside learner_a's turn.
     malicious_response = json.dumps(
         [
             {
+                "kind": "reweight",
                 "hypothesis_id": str(victim.id),
                 "new_probability": 0.99,
                 "new_confidence": 0.99,
-                "evidence_ref": {
-                    "turn_id": str(seed_turn_a),
-                    "polarity": "supporting",
-                },
+                "polarity": "supporting",
             }
         ]
     )
@@ -241,13 +236,11 @@ async def test_infer_rejects_a_hypothesis_id_never_shown_in_the_candidate_set(
     fabricated_response = json.dumps(
         [
             {
+                "kind": "reweight",
                 "hypothesis_id": str(fabricated_id),
                 "new_probability": 0.8,
                 "new_confidence": 0.8,
-                "evidence_ref": {
-                    "turn_id": str(await transcript.record_turn(session_id, 0, "seed")),
-                    "polarity": "supporting",
-                },
+                "polarity": "supporting",
             }
         ]
     )

@@ -9,6 +9,9 @@ matching independently, since evidence-satisfaction and leaf-prediction
 matching are different questions); a typed answer that satisfies
 nothing sets options_missed and that note reaches the next turn's
 generation prompt.
+
+Turn 0 never generates (see loop.py) — every test below starts with a
+throwaway turn 0 call, then generates on turn 1 onward.
 """
 
 from __future__ import annotations
@@ -123,7 +126,8 @@ async def test_a_click_marks_its_branch_matched_via_option_click(
                        revision_store, branch_store, option_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "I think I understand the idea generally")
+    await loop.handle_turn(session_id, 0, "hello")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "I think I understand the idea generally")
 
     generation0 = await branch_store.get_latest_generation(session_id)
     branches0 = await branch_store.list_by_generation(generation0.id)
@@ -137,7 +141,7 @@ async def test_a_click_marks_its_branch_matched_via_option_click(
     option = options0[0]
     assert option.branch_id == branch.id
 
-    await loop.handle_turn(session_id, 1, option.text, selected_option_id=option.id)
+    await loop.handle_turn(session_id, 2, option.text, selected_option_id=option.id)
 
     refreshed_branch = await branch_store.get(branch.id)
     assert refreshed_branch.evidence_satisfied is True
@@ -197,7 +201,8 @@ async def test_click_propagates_matched_up_the_ancestor_chain(
                        revision_store, branch_store, option_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "I think I get it")
+    await loop.handle_turn(session_id, 0, "hello")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "I think I get it")
 
     generation0 = await branch_store.get_latest_generation(session_id)
     branches0 = await branch_store.list_by_generation(generation0.id)
@@ -208,7 +213,7 @@ async def test_click_propagates_matched_up_the_ancestor_chain(
     options0 = await option_store.list_by_generation(generation0.id)
     option = next(o for o in options0 if o.branch_id == child.id)
 
-    await loop.handle_turn(session_id, 1, option.text, selected_option_id=option.id)
+    await loop.handle_turn(session_id, 2, option.text, selected_option_id=option.id)
 
     refreshed_root = await branch_store.get(root.id)
     refreshed_child = await branch_store.get(child.id)
@@ -241,7 +246,8 @@ async def test_clicking_one_option_supersedes_non_clicked_siblings_not_unmatched
                        revision_store, branch_store, option_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "I think I get the idea")
+    await loop.handle_turn(session_id, 0, "hello")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "I think I get the idea")
 
     generation0 = await branch_store.get_latest_generation(session_id)
     branches0 = await branch_store.list_by_generation(generation0.id)
@@ -253,7 +259,7 @@ async def test_clicking_one_option_supersedes_non_clicked_siblings_not_unmatched
     clicked_option = next(o for o in options0 if o.branch_id == clicked_branch.id)
 
     await loop.handle_turn(
-        session_id, 1, clicked_option.text, selected_option_id=clicked_option.id
+        session_id, 2, clicked_option.text, selected_option_id=clicked_option.id
     )
 
     refreshed_clicked = await branch_store.get(clicked_branch.id)
@@ -283,18 +289,19 @@ async def test_a_typed_match_satisfies_the_branch_identically_to_a_click(
                        revision_store, branch_store, option_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "I think I understand the idea generally")
+    await loop.handle_turn(session_id, 0, "hello")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "I think I understand the idea generally")
     generation0 = await branch_store.get_latest_generation(session_id)
     branch = (await branch_store.list_by_generation(generation0.id))[0]
 
     # Typed, not clicked -- no selected_option_id.
-    await loop.handle_turn(session_id, 1, "yes please show me a worked example")
+    await loop.handle_turn(session_id, 2, "yes please show me a worked example")
 
     refreshed_branch = await branch_store.get(branch.id)
     assert refreshed_branch.evidence_satisfied is True
     assert refreshed_branch.status is BranchStatus.OPEN
 
-    diag = await diagnostics_store.get_for_turn(session_id, 1)
+    diag = await diagnostics_store.get_for_turn(session_id, 2)
     assert diag.options_missed is False
     assert diag.node_call_counts.get("CheckEvidence") == 1
     assert not any("CheckEvidence failed" in w for w in diag.warnings)
@@ -325,10 +332,11 @@ async def test_typed_text_satisfying_nothing_sets_options_missed_and_informs_nex
                        revision_store, branch_store, option_store, diagnostics_store, llm)
     session_id = await transcript.create_session(learner_id, concept_graph_id)
 
-    await loop.handle_turn(session_id, 0, "I think I understand the idea generally")
-    await loop.handle_turn(session_id, 1, "totally unrelated tangent about something else")
+    await loop.handle_turn(session_id, 0, "hello")  # turn 0 never generates
+    await loop.handle_turn(session_id, 1, "I think I understand the idea generally")
+    await loop.handle_turn(session_id, 2, "totally unrelated tangent about something else")
 
-    diag1 = await diagnostics_store.get_for_turn(session_id, 1)
+    diag1 = await diagnostics_store.get_for_turn(session_id, 2)
     assert diag1.options_missed is True
     assert any("options_missed" in w for w in diag1.warnings)
     # A genuine "nothing satisfied" LLM judgment, not a swallowed error
@@ -340,8 +348,8 @@ async def test_typed_text_satisfying_nothing_sets_options_missed_and_informs_nex
     assert diag1.node_call_counts.get("CheckEvidence") == 1
     assert not any("CheckEvidence failed" in w for w in diag1.warnings)
 
-    # Turn 2's own GENERATE:INTENT prompt must carry the note forward.
-    await loop.handle_turn(session_id, 2, "another message")
+    # Turn 3's own GENERATE:INTENT prompt must carry the note forward.
+    await loop.handle_turn(session_id, 3, "another message")
     intent_prompts = [p for p in llm.prompts if p.startswith("GENERATE:INTENT")]
     assert len(intent_prompts) >= 2
     assert "options offered last turn did not match" in intent_prompts[-1]
