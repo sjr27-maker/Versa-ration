@@ -23,6 +23,7 @@ from probe.llm import ModelTierClients, StubLLMClient, build_tier_clients
 from probe.loop import SessionLoop
 from probe.memory import LearnerFactStore, ThinkingStyleStore
 from probe.models import Learner
+from probe import migrate as _migrate
 
 
 def _database_url() -> str:
@@ -149,16 +150,61 @@ async def _consolidate_session(session_id_str: str, use_stub: bool) -> None:
         await pool.close()
 
 
+async def _run_migrations(status_only: bool, do_baseline: bool) -> None:
+    pool = await create_pool(_database_url(), min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            if status_only:
+                applied, pending = await _migrate.status(conn)
+                print(f"migrations: {len(applied)} applied, {len(pending)} pending")
+                for name in applied:
+                    print(f"  [x] {name}")
+                for name in pending:
+                    print(f"  [ ] {name}")
+                return
+            if do_baseline:
+                stamped = await _migrate.baseline(conn)
+                if stamped:
+                    print(
+                        f"probe migrate: recorded {len(stamped)} migration(s) as "
+                        f"already-applied without running them "
+                        f"({stamped[0]} .. {stamped[-1]})"
+                    )
+                else:
+                    print("probe migrate: nothing to baseline - ledger already complete")
+                return
+            applied = await _migrate.apply_all(
+                conn, on_apply=lambda name: print(f"  applied {name}")
+            )
+            if applied:
+                print(f"probe migrate: applied {len(applied)} migration(s)")
+            else:
+                print("probe migrate: database already up to date")
+    finally:
+        await pool.close()
+
+
 def _web() -> None:
     """`probe web` — one command to launch the Streamlit UI. Shells out
     to `streamlit run` rather than importing streamlit here, so this
     module (and every other CLI command) has no dependency on the web
-    UI even existing; `probe web` is the only path that touches it."""
+    UI even existing; `probe web` is the only path that touches it.
+
+    Binds to the port Cloud Run (or any PaaS) injects via `PORT`, on
+    0.0.0.0 so the container's published port is reachable. Falls back
+    to Streamlit's own default (8501) locally, where PORT is unset, so
+    `probe web` on a workstation is unchanged."""
     import subprocess
 
     app_path = Path(__file__).resolve().parent / "webui" / "app.py"
+    port = os.environ.get("PORT", "8501")
     subprocess.run(
-        [sys.executable, "-m", "streamlit", "run", str(app_path)], check=False
+        [
+            sys.executable, "-m", "streamlit", "run", str(app_path),
+            "--server.port", port,
+            "--server.address", "0.0.0.0",
+        ],
+        check=False,
     )
 
 
@@ -202,6 +248,23 @@ def main() -> None:
         help="use StubLLMClient/StubEmbeddingClient instead of the "
         "real Gemini API (no GEMINI_API_KEY needed, no cost)",
     )
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="apply pending SQL migrations to DATABASE_URL, in order, "
+        "once each (idempotent; tracked in a schema_migrations table)",
+    )
+    migrate_parser.add_argument(
+        "--status",
+        action="store_true",
+        help="show applied/pending migrations and exit without changing anything",
+    )
+    migrate_parser.add_argument(
+        "--baseline",
+        action="store_true",
+        help="record every migration as already-applied WITHOUT running "
+        "it - for a database that already has the full schema but no "
+        "schema_migrations ledger (e.g. a hand-migrated dev DB)",
+    )
     subparsers.add_parser(
         "web",
         help="launch the local Streamlit web UI",
@@ -218,6 +281,8 @@ def main() -> None:
         asyncio.run(_chat(args.learner, args.stub))
     elif args.command == "consolidate-session":
         asyncio.run(_consolidate_session(args.session_id, args.stub))
+    elif args.command == "migrate":
+        asyncio.run(_run_migrations(args.status, args.baseline))
     elif args.command == "web":
         _web()
     elif args.command == "serve":
