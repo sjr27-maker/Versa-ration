@@ -888,7 +888,9 @@ dependencies = [
     { name = "pgvector" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "starlette" },
     { name = "streamlit" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -905,7 +907,9 @@ requires-dist = [
     { name = "pgvector", specifier = ">=0.5.0" },
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
+    { name = "starlette", specifier = ">=1.6.0" },
     { name = "streamlit", specifier = ">=1.62.0" },
+    { name = "uvicorn", specifier = ">=0.52.4" },
 ]
 
 [package.metadata.requires-dev]

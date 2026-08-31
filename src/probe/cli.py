@@ -162,6 +162,15 @@ def _web() -> None:
     )
 
 
+def _serve(host: str, port: int) -> None:
+    """`probe serve` — the calm single-page UI (probe/static/) backed by
+    the Starlette API in webserver.py, over the same SessionLoop the CLI
+    drives. Imported lazily so `probe chat` never pulls in Starlette."""
+    from probe.webserver import serve
+
+    serve(host=host, port=port)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="probe")
     subparsers = parser.add_subparsers(dest="command")
@@ -197,6 +206,12 @@ def main() -> None:
         "web",
         help="launch the local Streamlit web UI",
     )
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="launch the calm single-page UI (Starlette API + probe/static/)",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
     if args.command == "chat":
@@ -205,6 +220,8 @@ def main() -> None:
         asyncio.run(_consolidate_session(args.session_id, args.stub))
     elif args.command == "web":
         _web()
+    elif args.command == "serve":
+        _serve(args.host, args.port)
     else:
         parser.print_help()
         sys.exit(2)
