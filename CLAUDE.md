@@ -6,7 +6,14 @@ Copy `.env.example` to `.env` and fill in:
 
 - `DATABASE_URL` — Postgres connection string (dev DB and the test suite
   share this by default; running `pytest` wipes and rebuilds it from
-  migrations).
+  migrations). For a real, persistent database (Cloud SQL, staging),
+  apply the schema with `probe migrate` — it runs every
+  `src/probe/migrations/*.sql` in order, once each, tracked in a
+  `schema_migrations` ledger table, and is safe to re-run. `probe
+  migrate --status` shows applied/pending; `probe migrate --baseline`
+  adopts a database that already has the full schema but no ledger
+  (stamps every migration as applied without running it). `pytest`
+  does not use this path.
 - `GEMINI_API_KEY` — required for any real (non-stub) LLM call. Get one
   at https://aistudio.google.com/apikey. Every `probe` command that
   calls an LLM (`chat`, `seed-graph`) accepts `--stub` to run against
