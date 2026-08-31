@@ -38,6 +38,13 @@ class ModelTierConfig(BaseModel):
     fast: str = "gemini-3.6-flash"
     capable: str = "gemini-3.5-flash"
     best: str = "gemini-3.5-flash"
+    # The memory layer's embedding model (probe.embeddings) — verified
+    # live against this key: `text-embedding-004`/`models/embedding-001`
+    # both 404 (not available on the v1beta API this SDK version
+    # targets), `gemini-embedding-001` works. Not one of the three
+    # reasoning tiers above (it never generates text, only vectors), so
+    # kept as its own field rather than folded into fast/capable/best.
+    embedding: str = "gemini-embedding-001"
 
     @classmethod
     def from_env(cls) -> ModelTierConfig:
@@ -50,4 +57,5 @@ class ModelTierConfig(BaseModel):
             fast=os.getenv("GEMINI_MODEL_FAST", defaults.fast),
             capable=os.getenv("GEMINI_MODEL_CAPABLE", defaults.capable),
             best=os.getenv("GEMINI_MODEL_BEST", defaults.best),
+            embedding=os.getenv("GEMINI_MODEL_EMBEDDING", defaults.embedding),
         )

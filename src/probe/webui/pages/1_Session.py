@@ -15,6 +15,7 @@ from probe.loop import SessionLoop
 from probe.models import BranchStatus, OptionStatus, Tier
 from probe.nodes import MAX_CALLS_PER_TURN, SessionMissingTopicError
 from probe.webui.backend import (
+    get_embedding_client,
     get_stores,
     get_tier_clients,
     make_progress_tracker,
@@ -50,6 +51,7 @@ if (
     or st.session_state.get("loop_use_stub") != use_stub
 ):
     tiers = get_tier_clients(use_stub)
+    embedding_client = get_embedding_client(use_stub)
     progress, on_node_start = make_progress_tracker()
     st.session_state["loop"] = SessionLoop(
         hypothesis_store=stores.hypotheses,
@@ -66,6 +68,9 @@ if (
         on_node_start=on_node_start,
         ablation_config=ablation_config,
         disambiguation_store=stores.disambiguation,
+        learner_fact_store=stores.learner_facts,
+        thinking_style_store=stores.thinking_styles,
+        embedding_client=embedding_client,
     )
     st.session_state["progress"] = progress
     st.session_state["loop_session_id"] = session_id
@@ -96,7 +101,13 @@ st.caption(
     f"Learner: {learner.label or learner.id}  ·  topic: {topic or '(not yet attached)'}"
 )
 
-if ablation_config.is_full_bypass:
+if ablation_config.reasoning_mode is ReasoningMode.DISAMBIGUATE:
+    st.info(
+        "⚗ minimal_branch (ReasoningMode.DISAMBIGUATE) — AssessAndBranch "
+        "→ [options] → FinalAnswer, at most 3 calls per exchange. No "
+        "concept graph/portrait/Plan this session."
+    )
+elif ablation_config.is_full_bypass:
     st.warning("⚗ BASELINE — plain LLM, every subsystem off. Fixed for this session.")
 else:
     _off = [
@@ -115,6 +126,29 @@ else:
         "⚗ Ablation config (fixed for this session): "
         + ("full system — everything on" if not _off else f"off: {', '.join(_off)}")
     )
+
+# The memory layer's explicit, unambiguous consolidation trigger (see
+# memory.py steps 6-8 / SessionLoop.consolidate_session) — deliberately
+# has no turn-count gate the way run_interactive's own CLI-exit
+# auto-trigger does: a person clicking this has decided the session is
+# done, which is not a guess the way "the CLI process happened to
+# exit" is. A no-op (reported plainly) for a session with no
+# learner_facts at all — most commonly a full-system session, since
+# only ReasoningMode.DISAMBIGUATE turns ever write one.
+if st.button("End session & consolidate"):
+    consolidation_result = run_async(loop.consolidate_session(session_id))
+    if consolidation_result is None:
+        st.info(
+            "Nothing to consolidate — this session wrote no learner_facts "
+            "(not a minimal_branch session, or it never resolved anything)."
+        )
+    else:
+        st.success(
+            f"Thinking-style candidate {consolidation_result.id}: "
+            f"{consolidation_result.path_summary!r} "
+            f"(confirmation_count={consolidation_result.confirmation_count}, "
+            f"status={consolidation_result.status.value})"
+        )
 
 left, right = st.columns([3, 2])
 

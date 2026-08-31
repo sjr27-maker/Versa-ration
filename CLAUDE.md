@@ -256,3 +256,39 @@ a message later judged unambiguous, is still a fact about how this
 mode reasoned about that turn. Deleting any of it would erase the same
 kind of "what was actually offered, and what happened to it" trail
 invariant 8 protects, just for a different architecture.
+
+### 10. The memory layer is append-only
+
+`LearnerFactStore` (`learner_facts`) and `ThinkingStyleStore`
+(`thinking_style_candidates`) must never delete rows. Concretely:
+
+- No `delete` / `remove` methods on either class.
+- No `DELETE` SQL anywhere in the `memory` module or its migrations.
+- `learner_facts` rows are never mutated after insert — a fact is a
+  historical record of what was true at that turn, written once by
+  `WriteLearnerFact`, read many times by later searches, never edited.
+- A `thinking_style_candidates` row's `status` moves `candidate` ->
+  `confirmed`/`retired` via UPDATE only, same resurrection-over-
+  deletion principle as `HypothesisStore`'s tiers — a candidate that
+  stops matching is retired, not erased, and `confirmation_count`/
+  `session_ids` only ever grow, via `ThinkingStyleStore.confirm()`.
+- Verified by the same AST-based check used for invariants 1, 4, 6, 7,
+  8, and 9.
+
+This is a separate invariant from the others, not a restatement of
+any of them: the memory layer (`memory.py`) is a derived, searchable
+layer built on top of `DisambiguationStore` (invariant 9), not the
+same store or the same rationale — it exists to give minimal_branch
+cross-turn and cross-session recall, a concern neither invariant 6, 8,
+nor 9 was written to cover.
+
+Why: `learner_facts` is the literal record of how past uncertainty in
+a specific student was actually resolved — deleting or editing one
+would let the system quietly forget something it once confirmed,
+directly undermining the reason this layer exists (skip re-asking
+what's already known). `thinking_style_candidates` is a hypothesis
+about a cross-session pattern in exactly the same evidentiary sense
+`Hypothesis` is a claim about a learner (invariant 1) — a candidate
+that later stops matching is evidence the earlier confirmations were
+wrong or the pattern faded, which is itself worth keeping on record,
+not silently removing.

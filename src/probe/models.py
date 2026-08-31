@@ -833,6 +833,24 @@ class TurnDiagnostics(BaseModel):
     # reference was actually missed — see that function's docstring.
     # Always False when prior_reference_detected is False.
     prior_reference_unaddressed: bool = False
+    # The memory layer's own visibility fields (memory.py) — see
+    # LearnerFactStore/EmbedAndSearchFacts. `memory_match_found` is
+    # true whenever the semantic pre-check's vector search cleared
+    # MemoryConfig.fact_similarity_threshold, regardless of what the
+    # confirmation call then decided; `memory_match_confirmed_resolution`
+    # is true only when that confirmation call said the match actually
+    # resolves the current message. `branching_skipped_by_memory` is
+    # the literal behavioral consequence a reviewer would search for —
+    # AssessAndBranch never ran this turn because of the match — kept
+    # as its own field even though it is currently always equal to
+    # memory_match_confirmed_resolution, so "the thing that actually
+    # happened" is never left implicit. `matched_fact_id` traces which
+    # fact caused any of the above, whether or not it was ultimately
+    # confirmed.
+    memory_match_found: bool = False
+    memory_match_confirmed_resolution: bool = False
+    branching_skipped_by_memory: bool = False
+    matched_fact_id: UUID | None = None
     created_at: datetime = Field(default_factory=_utcnow)
 
 
@@ -908,3 +926,142 @@ class RecurringIntent(BaseModel):
     @property
     def match_rate(self) -> float:
         return self.matched_count / self.total_count if self.total_count else 0.0
+
+
+class LearnerFactType(str, Enum):
+    BRANCH_RESOLUTION = "branch_resolution"
+    DIRECT_ANSWER = "direct_answer"
+
+
+class LearnerFact(BaseModel):
+    """One row of the memory layer's durable, per-learner record (see
+    memory.py's module docstring) — plain English, written every turn
+    a real resolution happened (a click resolved an ambiguity, or
+    FinalAnswer answered directly), never on a turn that only raised
+    options with nothing yet decided.
+
+    `situation`/`resolution` are always in "the student's own terms,"
+    not restated jargon — `situation` is what was ambiguous or asked,
+    `resolution` is what was chosen (branch_resolution) or answered
+    (direct_answer) and, where available, why. `embedding` is over the
+    combined situation+resolution text (see memory.WriteLearnerFact),
+    so a search on either half of a past fact can still surface it.
+
+    Append-only (CLAUDE.md invariant 10): a fact is never edited or
+    superseded once written — even a fact that a later turn's
+    confirmation call judges "related but doesn't resolve" this
+    message stays exactly as recorded; it was still true of what
+    happened at `source_turn_id`.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    learner_id: UUID
+    session_id: UUID
+    turn_index: int
+    fact_type: LearnerFactType
+    situation: str
+    resolution: str
+    embedding: list[float]
+    source_turn_id: UUID
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class ExtractedFact(BaseModel):
+    """WriteLearnerFact's own node output (models.py, not DB-backed) —
+    deliberately excludes the embedding vector and every id: a node's
+    `output_json` in node_calls should read as a human-checkable fact,
+    not carry a 768-float array nobody will ever read there. The full
+    `LearnerFact` (with its embedding) is what actually gets persisted
+    to `learner_facts`, separately from this return value."""
+
+    situation: str
+    resolution: str
+
+
+class FactSearchResult(BaseModel):
+    """EmbedAndSearchFacts' own node output — the nearest learner_facts
+    match (if any) and its cosine similarity, deliberately without the
+    matched fact's embedding for the same node_calls-readability reason
+    as ExtractedFact. `matched_fact_id` is None when the learner simply
+    has no facts yet (a new learner, or turn 0) — not an error, the
+    expected shape before any fact has ever been written for them."""
+
+    matched_fact_id: UUID | None = None
+    situation: str | None = None
+    resolution: str | None = None
+    similarity: float | None = None
+
+
+class FactMatchConfirmation(BaseModel):
+    """ConfirmFactMatch's output — a strong vector-similarity hit is
+    not itself proof the matched fact resolves THIS message (see
+    memory.py's module docstring on not asserting a pattern before
+    it's earned); this is the structured judgment call that decides
+    whether the memory pre-check is actually allowed to skip branching,
+    not an inference from prose."""
+
+    resolves: bool
+
+
+class PathSummary(BaseModel):
+    """SummarizeSessionPath's output — a label for the STRUCTURE of one
+    session's ordered facts (e.g. "concrete example requested before
+    abstract definition, repeatedly"), deliberately abstract enough to
+    apply regardless of topic. Not itself a claim about the learner —
+    see ThinkingStyleCandidate for what a *pattern* requires before it
+    means anything."""
+
+    summary: str
+
+
+class ThinkingStyleConfirmation(BaseModel):
+    """ConfirmThinkingStyleMatch's output — does this session's labeled
+    path genuinely share the same order-structure as an existing
+    candidate, or only a superficial resemblance? Only a True here
+    advances ThinkingStyleCandidate.confirmation_count/session_ids;
+    vector similarity alone (what found the candidate to compare
+    against in the first place) is never sufficient by itself — see
+    memory.py's module docstring."""
+
+    confirms: bool
+
+
+class ThinkingStyleStatus(str, Enum):
+    CANDIDATE = "candidate"
+    CONFIRMED = "confirmed"
+    RETIRED = "retired"
+
+
+class ThinkingStyleCandidate(BaseModel):
+    """A hypothesized, cross-session order-structure for one learner —
+    e.g. "wants a concrete example before an abstract rule, regardless
+    of topic." Starts life as `candidate` (confirmation_count=1,
+    session_ids=[the one session it was first labeled from]) and stays
+    there, accumulating independent confirmations, until
+    `confirmation_count` crosses `MemoryConfig.thinking_style_
+    promotion_threshold` — only then does it become `confirmed` and
+    only then does it get fed into any live session's prompts (see
+    memory.py's module docstring: "nothing below should compromise
+    [the payoff] by asserting a pattern before it's actually been
+    earned across independent evidence").
+
+    `confirmation_count`/`session_ids` only ever grow via an explicit
+    `ConfirmThinkingStyleMatch` call saying yes — never from vector
+    similarity alone, which only finds which existing candidate (if
+    any) is worth asking that question about.
+
+    Append-only (CLAUDE.md invariant 10): `retired` is a status
+    transition via UPDATE, same resurrection-over-deletion principle as
+    HypothesisStore's tiers — a candidate that stops matching is not
+    erased, it stops being asked about.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    learner_id: UUID
+    session_ids: list[UUID]
+    path_summary: str
+    path_summary_embedding: list[float]
+    confirmation_count: int = 1
+    status: ThinkingStyleStatus = ThinkingStyleStatus.CANDIDATE
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)

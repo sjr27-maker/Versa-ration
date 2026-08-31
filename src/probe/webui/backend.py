@@ -39,8 +39,14 @@ from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
 from probe.disambiguate import DisambiguationStore
+from probe.embeddings import (
+    EmbeddingClient,
+    StubEmbeddingClient,
+    build_embedding_client,
+)
 from probe.learner import LearnerStore
 from probe.llm import ModelTierClients, StubLLMClient, build_tier_clients
+from probe.memory import LearnerFactStore, ThinkingStyleStore
 from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
 from probe.revision import WorldModelRevisionStore
@@ -115,6 +121,8 @@ class Stores:
         self.diagnostics = TurnDiagnosticsStore(pool)
         self.learners = LearnerStore(pool)
         self.disambiguation = DisambiguationStore(pool)
+        self.learner_facts = LearnerFactStore(pool)
+        self.thinking_styles = ThinkingStyleStore(pool)
 
 
 def get_stores() -> Stores:
@@ -133,6 +141,19 @@ def get_tier_clients(use_stub: bool) -> ModelTierClients:
             "Setup to run without a real key"
         )
     return build_tier_clients(api_key)
+
+
+def get_embedding_client(use_stub: bool) -> EmbeddingClient:
+    if use_stub:
+        return StubEmbeddingClient()
+    load_dotenv()
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY not set (check .env) — enable 'use stub' in "
+            "Setup to run without a real key"
+        )
+    return build_embedding_client(api_key)
 
 
 def make_progress_tracker() -> tuple[dict, Callable[[str], None]]:

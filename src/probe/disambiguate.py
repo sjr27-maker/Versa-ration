@@ -172,10 +172,22 @@ def _assess_prompt(
     recent_history: str = "",
     typed_past_note: str = "",
     rejected_reason: str = "",
+    thinking_style_hint: str = "",
 ) -> str:
     history_block = (
         f"\nRecent conversation, for context:\n{recent_history}\n" if recent_history else ""
     )
+    thinking_style_block = ""
+    if thinking_style_hint:
+        thinking_style_block = (
+            "\nAcross many prior sessions, this student has confirmed "
+            f"pattern(s) in how they move through material: {thinking_style_hint}\n"
+            "This describes an abstract order of engagement, not a "
+            "fact about the current topic — use it only to judge "
+            "whether a fork you're about to raise is one this student "
+            "would find genuinely ambiguous, not to assume anything "
+            "about the current subject matter itself.\n"
+        )
     correction = ""
     if rejected_reason:
         correction = (
@@ -186,6 +198,7 @@ def _assess_prompt(
     return (
         "ASSESS:BRANCH\n"
         f"{history_block}"
+        f"{thinking_style_block}"
         f"{typed_past_note}"
         f"\nStudent's message: {message}\n\n"
         "Is this message genuinely ambiguous or under-specified -- could "
@@ -261,12 +274,16 @@ class AssessAndBranch:
         message: str,
         recent_history: str = "",
         typed_past_note: str = "",
+        thinking_style_hint: str = "",
     ) -> DisambiguationAssessment:
         self.last_call_count = 0
         rejected_reason = ""
         for _ in range(_MAX_ASSESS_ATTEMPTS):
             raw = await self._llm.complete(
-                _assess_prompt(message, recent_history, typed_past_note, rejected_reason)
+                _assess_prompt(
+                    message, recent_history, typed_past_note, rejected_reason,
+                    thinking_style_hint,
+                )
             )
             self.last_call_count += 1
             assessment = _parse_assessment(raw)
@@ -429,6 +446,19 @@ class FinalAnswer:
     produced a cell-membrane biology diagram) before this field
     existed.
 
+    `memory_context` is set only on a memory-skip turn (see
+    memory.py's module docstring / loop.py's `_handle_disambiguation_turn`):
+    a *past* turn's fact — possibly from an earlier session entirely —
+    that a `ConfirmFactMatch` call already judged resolves this
+    message, so `AssessAndBranch` never ran at all this turn.
+    Deliberately a separate parameter from `branch_context`, not reused
+    for it: `branch_context` is this turn's own branch selection;
+    `memory_context` is a durable fact from possibly a different
+    session, and the two must never be conflated in the prompt (a
+    student's current message being treated as if it just went through
+    branching when it didn't would misrepresent what actually happened
+    this turn).
+
     Best tier: this is what the student actually sees, same tier as
     Teach/BaselineTeach.
     """
@@ -442,6 +472,7 @@ class FinalAnswer:
         student_message: str,
         branch_context: str | None = None,
         recent_history: str = "",
+        memory_context: str | None = None,
     ) -> str:
         self.last_call_count = 0
         context_block = ""
@@ -450,6 +481,13 @@ class FinalAnswer:
                 "\nThe student's earlier message was ambiguous; they "
                 f"confirmed they meant this specific reading: {branch_context!r}. "
                 "Answer accordingly -- do not re-ask which they meant.\n"
+            )
+        memory_block = ""
+        if memory_context:
+            memory_block = (
+                "\nThis student previously established the following, "
+                "and it directly applies to their current message -- "
+                f"use it, do not ask them to re-establish it: {memory_context}\n"
             )
         history_block = ""
         if recent_history:
@@ -465,6 +503,7 @@ class FinalAnswer:
             "You are a tutor having a conversation with a student. "
             "Respond directly and helpfully to their latest message.\n"
             f"{context_block}"
+            f"{memory_block}"
             f"{history_block}"
             f"\nStudent's message: {student_message}\n\n"
             "Lead with the direct answer or key idea -- do not open "

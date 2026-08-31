@@ -179,6 +179,17 @@ _DEFAULT_RESPONSES: dict[str, str] = {
     # GENERATE:OPTIONS — an empty list is valid, not rejected.
     "DISAMBIGUATE:OPTIONS": "[]",
     "FINAL:ANSWER": "[stub final answer]",
+    # memory.py's memory layer. Conservative default: a matched fact
+    # does NOT resolve the current message, so a test that doesn't opt
+    # in never accidentally skips branching.
+    "CONFIRM:FACT_MATCH": json.dumps({"resolves": False}),
+    "WRITE:FACT": json.dumps(
+        {"situation": "stub situation", "resolution": "stub resolution"}
+    ),
+    "SUMMARIZE:PATH": json.dumps({"summary": "stub path summary"}),
+    # Conservative default: does NOT confirm, so a test that doesn't
+    # opt in never accidentally grows a thinking_style_candidates row.
+    "CONFIRM:THINKING_STYLE": json.dumps({"confirms": False}),
 }
 
 
@@ -499,6 +510,29 @@ _SCHEMA_BY_PREFIX: dict[str, object] = {
     # what the prompt itself asks for (see BASELINE:TEACH's own
     # comment for the live failure this was confirmed to cause).
     "FINAL:ANSWER": _FREE_TEXT,
+    "CONFIRM:FACT_MATCH": {
+        "type": "OBJECT",
+        "properties": {"resolves": {"type": "BOOLEAN"}},
+        "required": ["resolves"],
+    },
+    "WRITE:FACT": {
+        "type": "OBJECT",
+        "properties": {
+            "situation": {"type": "STRING"},
+            "resolution": {"type": "STRING"},
+        },
+        "required": ["situation", "resolution"],
+    },
+    "SUMMARIZE:PATH": {
+        "type": "OBJECT",
+        "properties": {"summary": {"type": "STRING"}},
+        "required": ["summary"],
+    },
+    "CONFIRM:THINKING_STYLE": {
+        "type": "OBJECT",
+        "properties": {"confirms": {"type": "BOOLEAN"}},
+        "required": ["confirms"],
+    },
 }
 
 

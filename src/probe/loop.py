@@ -231,6 +231,7 @@ from probe.disambiguate import (
     FinalAnswer,
     build_typed_past_note,
 )
+from probe.embeddings import EmbeddingClient
 from probe.grounding import GroundConcept
 from probe.hypothesis_generator import (
     BranchGenerate,
@@ -244,6 +245,16 @@ from probe.hypothesis_generator import (
     check_current_belief_leak,
 )
 from probe.llm import LLMClient, ModelTierClients
+from probe.memory import (
+    ConfirmFactMatch,
+    ConfirmThinkingStyleMatch,
+    EmbedAndSearchFacts,
+    LearnerFactStore,
+    MemoryConfig,
+    SummarizeSessionPath,
+    ThinkingStyleStore,
+    WriteLearnerFact,
+)
 from probe.mismatch import MismatchDetector
 from probe.models import (
     BranchStatus,
@@ -251,7 +262,11 @@ from probe.models import (
     DisambiguationAssessment,
     DisambiguationBranch,
     ExplicitRequest,
+    ExtractedFact,
+    FactMatchConfirmation,
+    FactSearchResult,
     InferOutput,
+    LearnerFactType,
     Option,
     OptionStatus,
     PlanOutput,
@@ -389,6 +404,10 @@ class SessionLoop:
         on_node_start: Callable[[str], None] | None = None,
         ablation_config: AblationConfig | None = None,
         disambiguation_store: DisambiguationStore | None = None,
+        learner_fact_store: LearnerFactStore | None = None,
+        thinking_style_store: ThinkingStyleStore | None = None,
+        embedding_client: EmbeddingClient | None = None,
+        memory_config: MemoryConfig | None = None,
     ) -> None:
         # Tiering (fast/capable/best -> real Gemini models, see
         # model_config.py) is opt-in via model_tier_clients. Omitting it
@@ -563,11 +582,66 @@ class SessionLoop:
         # or has already been superseded by a later typed-past turn.
         self._prior_disambiguation_turn_id: UUID | None = None
 
+        # The memory layer (memory.py) — additive on top of
+        # minimal_branch, never required by it. `_memory_enabled` gates
+        # the per-turn semantic pre-check/fact-writing (needs both a
+        # place to search/write facts and something to embed with);
+        # `_thinking_styles` (the cross-session layer) is independently
+        # optional on top of that — consolidate_session needs it, but
+        # nothing per-turn does except reading already-`confirmed`
+        # candidates for AssessAndBranch's prompt (see
+        # `_build_thinking_style_hint`), which only needs the store
+        # itself, not an embedding client.
+        self._learner_facts = learner_fact_store
+        self._thinking_styles = thinking_style_store
+        self._embedding_client = embedding_client
+        self._memory_config = memory_config or MemoryConfig()
+        self._memory_enabled = (
+            learner_fact_store is not None and embedding_client is not None
+        )
+        if self._memory_enabled:
+            self.embed_and_search_facts = EmbedAndSearchFacts(
+                embedding_client, learner_fact_store, self._memory_config
+            )
+            self.confirm_fact_match = ConfirmFactMatch(tiers.fast)
+            self.write_learner_fact = WriteLearnerFact(
+                tiers.fast, embedding_client, learner_fact_store
+            )
+        else:
+            self.embed_and_search_facts = None
+            self.confirm_fact_match = None
+            self.write_learner_fact = None
+        # Background-only (see SessionLoop.consolidate_session) —
+        # needs the fact store (to assemble a session's ordered facts),
+        # the thinking-style store (to search/confirm/grow candidates
+        # against), and an embedding client (to embed the new
+        # path_summary) — independent of _memory_enabled above, though
+        # in practice all three are normally supplied together.
+        if (
+            learner_fact_store is not None
+            and thinking_style_store is not None
+            and embedding_client is not None
+        ):
+            self.summarize_session_path = SummarizeSessionPath(tiers.fast)
+            self.confirm_thinking_style_match = ConfirmThinkingStyleMatch(tiers.fast)
+        else:
+            self.summarize_session_path = None
+            self.confirm_thinking_style_match = None
+
     async def run_interactive(
         self, learner_id: UUID, concept_graph_id: UUID | None
     ) -> UUID:
+        # ablation_config is fixed for a session's lifetime (set-once,
+        # see TranscriptStore.set_ablation_config) — pass this loop's
+        # own config through explicitly so the persisted row always
+        # matches what actually ran, rather than defaulting to NULL
+        # ("full system") regardless of what this SessionLoop was
+        # constructed with. Read back identically to omitting it
+        # entirely when this is the default AblationConfig() (see
+        # get_ablation_config), so this is a no-op for every existing
+        # caller that never set a non-default config.
         session_id = await self._transcript.create_session(
-            learner_id, concept_graph_id
+            learner_id, concept_graph_id, ablation_config=self._ablation
         )
         print(f"probe: new session {session_id}")
         print("probe: type your message. ctrl-D or empty line + ctrl-C to exit.")
@@ -585,6 +659,25 @@ class SessionLoop:
             message = await self.handle_turn(session_id, turn_index, turn_text)
             print(f"probe: {message}")
             turn_index += 1
+
+        # Auto-consolidation on interactive exit (memory.py steps 6-8),
+        # gated by turn count: a session below
+        # MemoryConfig.min_turns_for_cli_auto_consolidation is not
+        # eligible at all -- a 2-turn session that got interrupted
+        # should not feed the thinking-style detector, only one the
+        # student plausibly walked all the way through should. No-ops
+        # harmlessly (via consolidate_session's own guards) for a
+        # full-system session (nothing in learner_facts to consolidate)
+        # or when the memory layer isn't configured at all.
+        if turn_index >= self._memory_config.min_turns_for_cli_auto_consolidation:
+            result = await self.consolidate_session(session_id)
+            if result is not None:
+                print(
+                    f"probe: consolidated this session's path — "
+                    f"thinking-style candidate {result.id} now has "
+                    f"confirmation_count={result.confirmation_count} "
+                    f"(status={result.status.value})"
+                )
         return session_id
 
     async def handle_turn(
@@ -1373,7 +1466,8 @@ class SessionLoop:
         warnings: list[str] = []
         node_call_counts: dict[str, int] = {}
 
-        await self._transcript.record_turn(session_id, turn_index, turn_text)
+        turn_id = await self._transcript.record_turn(session_id, turn_index, turn_text)
+        learner_id = await self._transcript.get_learner_id(session_id)
 
         # Same compact recent-history window AssessAndBranch gets (see
         # _build_disambiguation_history) -- computed once, up front, so
@@ -1388,10 +1482,12 @@ class SessionLoop:
         recent_history = await self._build_disambiguation_history(session_id, turn_index)
 
         # 3a: a click resolves immediately -- no AssessAndBranch this
-        # turn, the reading is already known. An unrecognized/stale
-        # option id (e.g. from a superseded generation) falls through
-        # to the normal flow below exactly like handle_turn's own
-        # click-handling does for the tree-based system.
+        # turn, the reading is already known, and no memory pre-check
+        # applies either (a click is already fully certain -- there is
+        # nothing left to shortcut). An unrecognized/stale option id
+        # (e.g. from a superseded generation) falls through to the
+        # normal flow below exactly like handle_turn's own click-
+        # handling does for the tree-based system.
         if selected_option_id is not None:
             option = await self._disambiguation.get_option(selected_option_id)
             if option is not None:
@@ -1399,19 +1495,23 @@ class SessionLoop:
                     option.id, OptionStatus.SELECTED
                 )
                 branch = await self._disambiguation.mark_matched(option.branch_id)
+                sibling_branches = await self._disambiguation.list_branches_for_turn(
+                    branch.disambiguation_turn_id
+                )
                 await self._disambiguation.supersede_open_branches(
                     branch.disambiguation_turn_id, exclude_ids=[branch.id]
                 )
                 await self._disambiguation.supersede_open_options(option.generation_id)
                 self._prior_disambiguation_turn_id = None
-                message, teach_failed = await self._run_final_answer(
-                    session_id,
-                    turn_index,
-                    turn_text,
-                    branch.statement,
-                    recent_history,
-                    node_call_counts,
-                    warnings,
+                message, teach_failed = await self._finish_turn_with_fact(
+                    session_id, turn_index, turn_text, turn_id, learner_id,
+                    branch_context=branch.statement,
+                    memory_context=None,
+                    recent_history=recent_history,
+                    fact_type=LearnerFactType.BRANCH_RESOLUTION,
+                    branch_statements=[b.statement for b in sibling_branches],
+                    node_call_counts=node_call_counts,
+                    warnings=warnings,
                 )
                 await self._record_disambiguation_diagnostics(
                     session_id, turn_index, node_call_counts, warnings,
@@ -1445,6 +1545,79 @@ class SessionLoop:
                     "being matched against"
                 )
 
+        # Semantic pre-check (memory.py steps 3-4): does a past fact for
+        # THIS learner -- possibly from an earlier session -- already
+        # resolve this exact message? Vector similarity alone never
+        # decides this (see memory.py's module docstring); only a
+        # confirmed "yes" is allowed to skip AssessAndBranch entirely.
+        memory_match_found = False
+        memory_match_confirmed = False
+        matched_fact_id: UUID | None = None
+        memory_context: str | None = None
+        if self._memory_enabled:
+            search_result = await self._call_node_or_warn(
+                self.embed_and_search_facts,
+                session_id,
+                turn_index,
+                "EmbedAndSearchFacts",
+                FactSearchResult(),
+                warnings,
+                learner_id=learner_id,
+                message=turn_text,
+            )
+            node_call_counts["EmbedAndSearchFacts"] = (
+                self.embed_and_search_facts.last_call_count
+            )
+            if search_result.matched_fact_id is not None:
+                memory_match_found = True
+                matched_fact_id = search_result.matched_fact_id
+                confirmation = await self._call_node_or_warn(
+                    self.confirm_fact_match,
+                    session_id,
+                    turn_index,
+                    "ConfirmFactMatch",
+                    FactMatchConfirmation(resolves=False),
+                    warnings,
+                    matched_situation=search_result.situation,
+                    matched_resolution=search_result.resolution,
+                    current_message=turn_text,
+                )
+                node_call_counts["ConfirmFactMatch"] = (
+                    self.confirm_fact_match.last_call_count
+                )
+                if confirmation.resolves:
+                    memory_match_confirmed = True
+                    memory_context = (
+                        f"{search_result.situation} -- {search_result.resolution}"
+                    )
+
+        if memory_match_confirmed:
+            # AssessAndBranch never runs this turn -- no
+            # DisambiguationTurn row is created for it either (there is
+            # nothing it would record beyond what turn_diagnostics
+            # already makes visible/auditable below).
+            message, teach_failed = await self._finish_turn_with_fact(
+                session_id, turn_index, turn_text, turn_id, learner_id,
+                branch_context=None,
+                memory_context=memory_context,
+                recent_history=recent_history,
+                fact_type=LearnerFactType.DIRECT_ANSWER,
+                branch_statements=None,
+                node_call_counts=node_call_counts,
+                warnings=warnings,
+            )
+            await self._record_disambiguation_diagnostics(
+                session_id, turn_index, node_call_counts, warnings,
+                teach_failed, start, retry_count_start,
+                memory_match_found=memory_match_found,
+                memory_match_confirmed_resolution=memory_match_confirmed,
+                branching_skipped_by_memory=True,
+                matched_fact_id=matched_fact_id,
+            )
+            self._last_teach_message = message
+            return message
+
+        thinking_style_hint = await self._build_thinking_style_hint(learner_id)
         assessment = await self._call_node_or_warn(
             self.assess_and_branch,
             session_id,
@@ -1455,6 +1628,7 @@ class SessionLoop:
             message=turn_text,
             recent_history=recent_history,
             typed_past_note=typed_past_note,
+            thinking_style_hint=thinking_style_hint,
         )
         node_call_counts["AssessAndBranch"] = self.assess_and_branch.last_call_count
 
@@ -1465,13 +1639,21 @@ class SessionLoop:
             await self._disambiguation.create_turn(
                 session_id, turn_index, needs_branches=False, turn_had_direct_answer=True
             )
-            message, teach_failed = await self._run_final_answer(
-                session_id, turn_index, turn_text, None, recent_history,
-                node_call_counts, warnings,
+            message, teach_failed = await self._finish_turn_with_fact(
+                session_id, turn_index, turn_text, turn_id, learner_id,
+                branch_context=None,
+                memory_context=None,
+                recent_history=recent_history,
+                fact_type=LearnerFactType.DIRECT_ANSWER,
+                branch_statements=None,
+                node_call_counts=node_call_counts,
+                warnings=warnings,
             )
             await self._record_disambiguation_diagnostics(
                 session_id, turn_index, node_call_counts, warnings,
                 teach_failed, start, retry_count_start,
+                memory_match_found=memory_match_found,
+                matched_fact_id=matched_fact_id,
             )
             self._last_teach_message = message
             return message
@@ -1513,13 +1695,21 @@ class SessionLoop:
                 "ambiguous but no usable options were generated -- "
                 "answering directly instead of showing nothing"
             )
-            message, teach_failed = await self._run_final_answer(
-                session_id, turn_index, turn_text, None, recent_history,
-                node_call_counts, warnings,
+            message, teach_failed = await self._finish_turn_with_fact(
+                session_id, turn_index, turn_text, turn_id, learner_id,
+                branch_context=None,
+                memory_context=None,
+                recent_history=recent_history,
+                fact_type=LearnerFactType.DIRECT_ANSWER,
+                branch_statements=None,
+                node_call_counts=node_call_counts,
+                warnings=warnings,
             )
             await self._record_disambiguation_diagnostics(
                 session_id, turn_index, node_call_counts, warnings,
                 teach_failed, start, retry_count_start,
+                memory_match_found=memory_match_found,
+                matched_fact_id=matched_fact_id,
             )
             self._last_teach_message = message
             return message
@@ -1538,18 +1728,68 @@ class SessionLoop:
         self._prior_disambiguation_turn_id = disamb_turn.id
 
         # No FinalAnswer this turn -- options are shown INSTEAD of an
-        # answer (see module docstring). The option texts themselves
-        # are read by the caller (web UI/CLI) from
-        # DisambiguationStore.list_options_for_turn, the same way the
-        # tree-based system's own options are read separately from
-        # handle_turn's string return value.
+        # answer (see module docstring). Nothing was resolved yet, so
+        # no fact is written either (see WriteLearnerFact's own
+        # docstring: exactly one fact per turn that actually resolved
+        # something). The option texts themselves are read by the
+        # caller (web UI/CLI) from DisambiguationStore.
+        # list_options_for_turn, the same way the tree-based system's
+        # own options are read separately from handle_turn's string
+        # return value.
         message = "Which of these did you mean?"
         await self._record_disambiguation_diagnostics(
             session_id, turn_index, node_call_counts, warnings,
             teach_failed=False, start=start, retry_count_start=retry_count_start,
+            memory_match_found=memory_match_found,
+            matched_fact_id=matched_fact_id,
         )
         self._last_teach_message = message
         return message
+
+    async def _finish_turn_with_fact(
+        self,
+        session_id: UUID,
+        turn_index: int,
+        turn_text: str,
+        turn_id: UUID,
+        learner_id: UUID,
+        branch_context: str | None,
+        memory_context: str | None,
+        recent_history: str,
+        fact_type: LearnerFactType,
+        branch_statements: list[str] | None,
+        node_call_counts: dict[str, int],
+        warnings: list[str],
+    ) -> tuple[str, bool]:
+        """Every path through `_handle_disambiguation_turn` that
+        actually resolves something (a click, a memory-confirmed
+        shortcut, an unambiguous direct answer, or the empty-options
+        fallback) ends here: run FinalAnswer, then — memory.py step 5
+        — write exactly one fact recording what just happened, unless
+        FinalAnswer itself failed (nothing real to record then)."""
+        message, teach_failed = await self._run_final_answer(
+            session_id, turn_index, turn_text, branch_context, recent_history,
+            node_call_counts, warnings, memory_context=memory_context,
+        )
+        if not teach_failed and self._memory_enabled:
+            await self._call_node_or_warn(
+                self.write_learner_fact,
+                session_id,
+                turn_index,
+                "WriteLearnerFact",
+                ExtractedFact(situation="", resolution=""),
+                warnings,
+                fact_type=fact_type,
+                learner_id=learner_id,
+                session_id=session_id,
+                turn_index=turn_index,
+                source_turn_id=turn_id,
+                student_message=turn_text,
+                tutor_message=message,
+                branch_statements=branch_statements,
+            )
+            node_call_counts["WriteLearnerFact"] = self.write_learner_fact.last_call_count
+        return message, teach_failed
 
     async def _run_final_answer(
         self,
@@ -1560,6 +1800,7 @@ class SessionLoop:
         recent_history: str,
         node_call_counts: dict[str, int],
         warnings: list[str],
+        memory_context: str | None = None,
     ) -> tuple[str, bool]:
         """FinalAnswer has no fallback -- its output IS the turn, same
         discipline as Teach (see handle_turn's own dedicated
@@ -1578,6 +1819,7 @@ class SessionLoop:
                 student_message=turn_text,
                 branch_context=branch_context,
                 recent_history=recent_history,
+                memory_context=memory_context,
             )
             node_call_counts["FinalAnswer"] = self.final_answer.last_call_count
             return message, False
@@ -1592,6 +1834,95 @@ class SessionLoop:
             )
             node_call_counts["FinalAnswer"] = 0
             return _TEACH_FAILURE_MESSAGE, True
+
+    async def _build_thinking_style_hint(self, learner_id: UUID) -> str:
+        """Step 8's "only once promoted does it get fed into future
+        sessions' prompts" — the one place `AssessAndBranch`'s prompt
+        input is built from `thinking_style_candidates`, and the only
+        read it is allowed to use (`list_confirmed_for_prompt`
+        structurally excludes anything not yet `confirmed`). Empty
+        string (no prompt block at all — see disambiguate.py's
+        `_assess_prompt`) whenever this layer is off or nothing has
+        been promoted yet for this learner."""
+        if self._thinking_styles is None:
+            return ""
+        confirmed = await self._thinking_styles.list_confirmed_for_prompt(learner_id)
+        if not confirmed:
+            return ""
+        return "; ".join(c.path_summary for c in confirmed)
+
+    async def consolidate_session(self, session_id: UUID):
+        """Steps 6-8 of memory.py's flow — background-only, by design
+        never called from `handle_turn`/`_handle_disambiguation_turn`:
+        labeling and comparing an ENTIRE session's order-structure only
+        means something once the session actually has one, and doing
+        it mid-turn would mean re-doing the same expensive comparison
+        every single turn for no new information most of the time.
+        Callers: cli.py's standalone `probe consolidate-session`
+        command, `run_interactive`'s own turn-count-gated auto-trigger
+        on exit, and the web UI's explicit "End session & consolidate"
+        button — never SessionLoop itself.
+
+        Returns None when there is nothing to consolidate (the
+        thinking-style layer isn't configured, or this session wrote
+        no facts at all — e.g. it never resolved anything). Otherwise
+        returns the `ThinkingStyleCandidate` this session ended up
+        confirming (which may have just been promoted to `confirmed`
+        as a result) or newly created.
+
+        Only the NEAREST existing candidate is ever asked about (see
+        module docstring: "on a real match" is singular) — this is not
+        a fan-out over every plausible candidate, since a session has
+        exactly one order-structure to compare, not several.
+        """
+        if (
+            self.summarize_session_path is None
+            or self.confirm_thinking_style_match is None
+            or self._learner_facts is None
+            or self._thinking_styles is None
+            or self._embedding_client is None
+        ):
+            return None
+
+        facts = await self._learner_facts.list_by_session(session_id)
+        if not facts:
+            return None
+
+        learner_id = await self._transcript.get_learner_id(session_id)
+        turns = await self._transcript.list_turns(session_id)
+        last_turn_index = max((t.turn_index for t in turns), default=0)
+
+        path_summary = await self._call_node(
+            self.summarize_session_path, session_id, last_turn_index, facts=facts,
+        )
+        embedding = await self._embedding_client.embed(path_summary.summary)
+
+        nearest = await self._thinking_styles.search_similar(learner_id, embedding, limit=1)
+        if nearest:
+            candidate, similarity = nearest[0]
+            if similarity >= self._memory_config.thinking_style_similarity_threshold:
+                confirmation = await self._call_node(
+                    self.confirm_thinking_style_match,
+                    session_id,
+                    last_turn_index,
+                    existing_path_summary=candidate.path_summary,
+                    new_path_summary=path_summary.summary,
+                )
+                if confirmation.confirms:
+                    return await self._thinking_styles.confirm(
+                        candidate.id,
+                        session_id,
+                        promotion_threshold=self._memory_config.thinking_style_promotion_threshold,
+                    )
+
+        # No existing candidate was even worth asking about, or the
+        # confirmation call said the resemblance was only superficial
+        # -- either way, this session's own labeled path becomes a
+        # brand new candidate (confirmation_count=1), never silently
+        # folded into an unconfirmed match.
+        return await self._thinking_styles.create_candidate(
+            learner_id, session_id, path_summary.summary, embedding,
+        )
 
     async def _build_disambiguation_history(
         self, session_id: UUID, turn_index: int
@@ -1630,6 +1961,10 @@ class SessionLoop:
         teach_failed: bool,
         start: float,
         retry_count_start: int,
+        memory_match_found: bool = False,
+        memory_match_confirmed_resolution: bool = False,
+        branching_skipped_by_memory: bool = False,
+        matched_fact_id: UUID | None = None,
     ) -> None:
         if self._diagnostics is None:
             return
@@ -1639,6 +1974,17 @@ class SessionLoop:
             warnings.append(
                 f"MAX_CALLS_PER_TURN exceeded: {total_call_count} calls "
                 f"(limit {MAX_CALLS_PER_TURN})"
+            )
+        if branching_skipped_by_memory:
+            # Must be visible and auditable per turn, never a silent
+            # shortcut (see memory.py's module docstring) — the boolean
+            # fields alone satisfy that for structured queries, but a
+            # warning also puts it directly in front of anyone reading
+            # this turn's diagnostics in the web UI.
+            warnings.append(
+                f"branching_skipped_by_memory: fact {matched_fact_id} was "
+                "confirmed to resolve this message -- AssessAndBranch was "
+                "never called this turn"
             )
         await self._diagnostics.record(
             TurnDiagnostics(
@@ -1652,6 +1998,10 @@ class SessionLoop:
                 warnings=warnings,
                 teach_failed=teach_failed,
                 retry_count=_total_retry_count(self._tiers) - retry_count_start,
+                memory_match_found=memory_match_found,
+                memory_match_confirmed_resolution=memory_match_confirmed_resolution,
+                branching_skipped_by_memory=branching_skipped_by_memory,
+                matched_fact_id=matched_fact_id,
             )
         )
 

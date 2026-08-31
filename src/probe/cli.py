@@ -10,14 +10,22 @@ from uuid import UUID
 
 from dotenv import load_dotenv
 
+from probe.ablation import AblationConfig, ReasoningMode
 from probe.audit import NodeCallStore, TranscriptStore
 from probe.branches import BranchStore
 from probe.concept_graph import ConceptGraph, ConceptValidationError
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
+from probe.disambiguate import DisambiguationStore
+from probe.embeddings import (
+    EmbeddingClient,
+    StubEmbeddingClient,
+    build_embedding_client,
+)
 from probe.learner import LearnerStore
 from probe.llm import LLMClient, ModelTierClients, StubLLMClient, build_tier_clients
 from probe.loop import SessionLoop
+from probe.memory import LearnerFactStore, ThinkingStyleStore
 from probe.models import ConceptGraphMeta, Learner
 from probe.options import OptionStore
 from probe.overlay import LearnerOverlay
@@ -54,6 +62,12 @@ def _build_tier_clients(use_stub: bool) -> ModelTierClients:
         stub = StubLLMClient()
         return ModelTierClients(fast=stub, capable=stub, best=stub)
     return build_tier_clients(_require_gemini_api_key())
+
+
+def _build_embedding_client(use_stub: bool) -> EmbeddingClient:
+    if use_stub:
+        return StubEmbeddingClient()
+    return build_embedding_client(_require_gemini_api_key())
 
 
 async def _resolve_learner(store: LearnerStore, spec: str) -> Learner:
@@ -159,15 +173,41 @@ async def _resolve_graph(
     return await _do_seed_graph(graph, spec, llm)
 
 
-async def _chat(learner_spec: str, topic_spec: str, use_stub: bool) -> None:
+async def _chat(
+    learner_spec: str, topic_spec: str | None, use_stub: bool, minimal_branch: bool
+) -> None:
     tiers = _build_tier_clients(use_stub)
+    # The memory layer (memory.py) rides along on every `probe chat`
+    # session, not just --minimal-branch ones — it only ever writes
+    # anything when ReasoningMode.DISAMBIGUATE's own turn-handling
+    # calls it, so a full-system session simply never touches
+    # learner_facts/thinking_style_candidates, same "opt-in by what
+    # actually calls it" pattern as branch_store/option_store already
+    # being always-constructed-but-conditionally-used elsewhere in
+    # this module.
+    embedding_client = _build_embedding_client(use_stub)
     pool = await create_pool(_database_url(), min_size=1, max_size=4)
     try:
         learner = await _resolve_learner(LearnerStore(pool), learner_spec)
-        graph_meta = await _resolve_graph(ConceptGraph(pool), topic_spec, tiers.capable)
         label_suffix = f" (label={learner.label!r})" if learner.label else ""
         print(f"probe: learner {learner.id}{label_suffix}")
-        print(f"probe: concept graph {graph_meta.id} (topic={graph_meta.topic!r})")
+
+        ablation_config: AblationConfig | None = None
+        graph_id: UUID | None = None
+        if minimal_branch:
+            # minimal_branch replaces the concept-graph/branch-tree/
+            # Plan machinery outright (see disambiguate.py's module
+            # docstring) — --topic is meaningless here, never resolved
+            # or seeded.
+            ablation_config = AblationConfig(reasoning_mode=ReasoningMode.DISAMBIGUATE)
+            print("probe: minimal_branch mode — no concept graph")
+        else:
+            if topic_spec is None:
+                print("error: --topic is required unless --minimal-branch is set", file=sys.stderr)
+                sys.exit(2)
+            graph_meta = await _resolve_graph(ConceptGraph(pool), topic_spec, tiers.capable)
+            graph_id = graph_meta.id
+            print(f"probe: concept graph {graph_meta.id} (topic={graph_meta.topic!r})")
 
         loop = SessionLoop(
             hypothesis_store=HypothesisStore(pool),
@@ -181,8 +221,62 @@ async def _chat(learner_spec: str, topic_spec: str, use_stub: bool) -> None:
             branch_store=BranchStore(pool),
             option_store=OptionStore(pool),
             diagnostics_store=TurnDiagnosticsStore(pool),
+            ablation_config=ablation_config,
+            disambiguation_store=DisambiguationStore(pool),
+            learner_fact_store=LearnerFactStore(pool),
+            thinking_style_store=ThinkingStyleStore(pool),
+            embedding_client=embedding_client,
         )
-        await loop.run_interactive(learner.id, graph_meta.id)
+        await loop.run_interactive(learner.id, graph_id)
+    finally:
+        await pool.close()
+
+
+async def _consolidate_session(session_id_str: str, use_stub: bool) -> None:
+    try:
+        session_id = UUID(session_id_str)
+    except ValueError:
+        print(f"error: {session_id_str!r} is not a valid session id", file=sys.stderr)
+        sys.exit(2)
+
+    tiers = _build_tier_clients(use_stub)
+    embedding_client = _build_embedding_client(use_stub)
+    pool = await create_pool(_database_url(), min_size=1, max_size=4)
+    try:
+        transcript = TranscriptStore(pool)
+        loop = SessionLoop(
+            hypothesis_store=HypothesisStore(pool),
+            transcript=transcript,
+            node_calls=NodeCallStore(pool),
+            concept_graph=ConceptGraph(pool),
+            learner_overlay=LearnerOverlay(pool),
+            revision_store=WorldModelRevisionStore(pool),
+            llm=tiers.fast,
+            model_tier_clients=tiers,
+            disambiguation_store=DisambiguationStore(pool),
+            learner_fact_store=LearnerFactStore(pool),
+            thinking_style_store=ThinkingStyleStore(pool),
+            embedding_client=embedding_client,
+        )
+        # Deliberate, unambiguous trigger — no turn-count gate (unlike
+        # run_interactive's own auto-consolidate on exit): this command
+        # exists specifically to consolidate a session on demand,
+        # regardless of how many turns it has.
+        result = await loop.consolidate_session(session_id)
+        if result is None:
+            print(
+                "probe: nothing to consolidate — this session wrote no "
+                "learner_facts (not a minimal_branch session, or it "
+                "never resolved anything)"
+            )
+            return
+        print(
+            f"probe: thinking-style candidate {result.id}\n"
+            f"  path_summary: {result.path_summary}\n"
+            f"  confirmation_count={result.confirmation_count} "
+            f"status={result.status.value}\n"
+            f"  session_ids: {[str(s) for s in result.session_ids]}"
+        )
     finally:
         await pool.close()
 
@@ -359,15 +453,39 @@ def main() -> None:
     )
     chat_parser.add_argument(
         "--topic",
-        required=True,
+        required=False,
+        default=None,
         help="topic label (resumes/asks if a matching graph exists, "
-        "seeds fresh if not) or an existing concept graph's UUID",
+        "seeds fresh if not) or an existing concept graph's UUID. "
+        "Required unless --minimal-branch is set (that mode has no "
+        "concept graph at all).",
     )
     chat_parser.add_argument(
         "--stub",
         action="store_true",
-        help="use StubLLMClient instead of the real Gemini API (no "
-        "GEMINI_API_KEY needed, no cost)",
+        help="use StubLLMClient/StubEmbeddingClient instead of the "
+        "real Gemini API (no GEMINI_API_KEY needed, no cost)",
+    )
+    chat_parser.add_argument(
+        "--minimal-branch",
+        action="store_true",
+        help="run this session under ReasoningMode.DISAMBIGUATE "
+        "(AssessAndBranch -> [options] -> FinalAnswer, at most 3 calls "
+        "per exchange, no concept graph/portrait/Plan) instead of the "
+        "full system — see disambiguate.py",
+    )
+    consolidate_parser = subparsers.add_parser(
+        "consolidate-session",
+        help="background step 6-8 of the memory layer (memory.py) for "
+        "one session on demand: label its facts' order-structure and "
+        "compare against this learner's thinking_style_candidates",
+    )
+    consolidate_parser.add_argument("session_id", help="session id (UUID) to consolidate")
+    consolidate_parser.add_argument(
+        "--stub",
+        action="store_true",
+        help="use StubLLMClient/StubEmbeddingClient instead of the "
+        "real Gemini API (no GEMINI_API_KEY needed, no cost)",
     )
     seed_parser = subparsers.add_parser(
         "seed-graph",
@@ -399,7 +517,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "chat":
-        asyncio.run(_chat(args.learner, args.topic, args.stub))
+        asyncio.run(_chat(args.learner, args.topic, args.stub, args.minimal_branch))
+    elif args.command == "consolidate-session":
+        asyncio.run(_consolidate_session(args.session_id, args.stub))
     elif args.command == "seed-graph":
         asyncio.run(_seed_graph(" ".join(args.topic), args.stub))
     elif args.command == "review-revisions":
