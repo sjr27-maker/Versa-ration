@@ -159,6 +159,17 @@ input,button{font-family:inherit}
 .btn:disabled{opacity:.5;cursor:default}
 .field{font-family:'JetBrains Mono',monospace;font-size:11px;color:#1a1815;background:#fff;border:1px solid #e3ded3;border-radius:8px;padding:8px 10px;word-break:break-all}
 .ok-note{color:#5aa15a;font-size:12px;line-height:1.5}
+.ev-card{border:1px solid #e3ded3;border-radius:12px;background:#fff;padding:14px;margin-bottom:10px}
+.ev-card .meta{font-family:'JetBrains Mono',monospace;font-size:9px;color:#8a8478;letter-spacing:1px;margin-bottom:8px}
+.ev-card .ev-title{font-size:13.5px;color:#1a1815;line-height:1.4;font-weight:500}
+.ev-card .ev-summary{font-size:12.5px;color:#5b5750;line-height:1.5;margin-top:6px}
+.ev-src{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:8.5px;letter-spacing:1px;padding:2px 7px;border-radius:20px;margin-bottom:8px;border:1px solid #d5cfc0;color:#8a8478}
+.ev-src.staged{border-color:#c2410c;color:#c2410c;background:rgba(194,65,12,0.06)}
+.ev-src.organic{border-color:#5aa15a;color:#5aa15a;background:rgba(90,161,90,0.06)}
+.ev-card details{margin-top:10px}
+.ev-card summary{font-family:'JetBrains Mono',monospace;font-size:10px;color:#8a8478;cursor:pointer;letter-spacing:0.5px}
+.ev-card pre{margin:8px 0 0;padding:10px;background:#faf7f1;border:1px solid #e3ded3;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:10px;line-height:1.45;color:#3b3730;white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto}
+.ev-note{background:rgba(194,65,12,0.06);border:1px solid rgba(194,65,12,0.25);border-radius:10px;padding:10px 12px;font-size:11.5px;color:#9a2f08;line-height:1.5;margin-bottom:14px}
 @media (max-width:900px){.inspector{position:fixed;right:0;top:0;z-index:40;box-shadow:-8px 0 40px rgba(0,0,0,0.12)}.empty-hero .big{font-size:60px;letter-spacing:-2px}}
 </style>
 </head>
@@ -207,6 +218,9 @@ input,button{font-family:inherit}
     </button>
     <button class="rail-btn" id="btnStory" title="learner memory">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6b665a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
+    </button>
+    <button class="rail-btn" id="btnEvidence" title="verification evidence">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6b665a" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3h6M10 3v5.5L5 18a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 18l-5-9.5V3"></path><path d="M7.5 14h9"></path></svg>
     </button>
   </div>
 

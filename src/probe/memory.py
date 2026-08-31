@@ -60,6 +60,7 @@ from uuid import UUID, uuid4
 import asyncpg
 from pydantic import BaseModel
 
+from probe import embeddings
 from probe.embeddings import EmbeddingClient
 from probe.llm import LLMClient
 from probe.models import (
@@ -84,18 +85,31 @@ class MemoryConfig(BaseModel):
     """
 
     # Cosine similarity a learner_facts match must clear before
-    # ConfirmFactMatch is even asked about it (step 3-4). 0.85 is a
-    # deliberately strict starting point, not a measured one — no real
-    # usage data exists yet to tune it against (same "arbitrary
-    # placeholder, revisit once real session data exists" honesty as
-    # DIAGNOSE_MISMATCH_THRESHOLD/_GROUNDING_CONFIDENCE_THRESHOLD
-    # elsewhere). Erring strict is the safer direction for a mechanism
-    # that skips reasoning the moment it fires.
-    fact_similarity_threshold: float = 0.85
-    # Same reasoning, for step 7's search over thinking_style_
-    # candidates' path_summary embeddings — an existing candidate is
-    # only worth ASKING ConfirmThinkingStyleMatch about above this bar.
-    thinking_style_similarity_threshold: float = 0.80
+    # ConfirmFactMatch is even asked about it (step 3-4).
+    #
+    # Was 0.85 — a hand-picked "deliberately strict" placeholder. Now
+    # measured against real gemini-embedding-001 output (768-dim,
+    # asymmetric RETRIEVAL_QUERY/DOCUMENT — see embeddings.TASK_*):
+    #   * a genuine paraphrase match ("which rule for x^5?" vs a stored
+    #     fact about the power rule for x^5)      -> ~0.80
+    #   * topically adjacent but a different question
+    #     ("which rule for x^5?" vs a fact about *disambiguating the
+    #      word 'derivatives'")                    -> ~0.57
+    #   * different topic entirely
+    #     (a limits question vs a derivatives fact) -> ~0.55
+    # 0.85 sat ABOVE the paraphrase band, so the pre-check could
+    # essentially never fire on real usage. 0.72 clears real matches
+    # while still rejecting the ~0.57 "related but different" band with
+    # margin — and it is only the FIRST of two gates (ConfirmFactMatch's
+    # structured yes/no still has to agree before any branching is
+    # skipped), so a slightly looser vector bar just means "ask the
+    # confirming LLM a bit more often", never "skip on similarity alone".
+    fact_similarity_threshold: float = 0.72
+    # Same reasoning / same measured embedding behaviour, for step 7's
+    # search over thinking_style_candidates' path_summary embeddings —
+    # an existing candidate is only worth ASKING ConfirmThinkingStyleMatch
+    # about above this bar (and that call is again a second gate).
+    thinking_style_similarity_threshold: float = 0.72
     # How many INDEPENDENT sessions must confirm the same order-
     # structure before it becomes a durable, LLM-facing claim (step 8).
     # Deliberately well above "2-3, could be coincidence" per this
@@ -230,7 +244,9 @@ class EmbedAndSearchFacts:
 
     async def run(self, learner_id: UUID, message: str) -> FactSearchResult:
         self.last_call_count = 0
-        embedding = await self._embed.embed(message)
+        # The retrieval QUERY side of an asymmetric pair — the stored
+        # facts are embedded as DOCUMENTs (see WriteLearnerFact).
+        embedding = await self._embed.embed(message, task_type=embeddings.TASK_QUERY)
         self.last_call_count += 1
         matches = await self._facts.search_similar(
             learner_id, embedding, limit=self._config.search_limit
@@ -314,7 +330,14 @@ class WriteLearnerFact:
         self.last_call_count += 1
         extracted = _parse_extracted_fact(raw, student_message, tutor_message)
 
-        embedding = await self._embed.embed(f"{extracted.situation}\n{extracted.resolution}")
+        # The retrieval DOCUMENT side of an asymmetric pair — searched
+        # by EmbedAndSearchFacts' TASK_QUERY embedding of a later
+        # message. situation+resolution so a query phrased like either
+        # the original question or the answer can surface it.
+        embedding = await self._embed.embed(
+            f"{extracted.situation}\n{extracted.resolution}",
+            task_type=embeddings.TASK_DOCUMENT,
+        )
         self.last_call_count += 1
 
         await self._facts.add(

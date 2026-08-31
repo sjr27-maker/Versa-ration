@@ -2,7 +2,7 @@
 single-page UI in ``probe/static/`` is the only client. Launched by
 ``probe serve`` (see ``cli.py``).
 
-Same stance as ``webui/backend.py``: no business logic here. Every
+No business logic here (this and the static client are the whole web UI). Every
 route wires an existing store or ``SessionLoop`` method onto an HTTP
 shape and computes nothing a store doesn't already return. The single
 piece of genuinely new glue is per-turn node-progress streaming — and
@@ -46,6 +46,7 @@ from probe.baseline import MAX_CALLS_PER_TURN as _MAX_CALLS_PER_TURN
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
 from probe.disambiguate import DisambiguationStore
+from probe.evidence import EvidenceStore
 from probe.embeddings import (
     EmbeddingClient,
     StubEmbeddingClient,
@@ -139,6 +140,7 @@ def _stores() -> dict:
         "disambiguation": DisambiguationStore(pool),
         "learner_facts": LearnerFactStore(pool),
         "thinking_styles": ThinkingStyleStore(pool),
+        "evidence": EvidenceStore(pool),
     }
 
 
@@ -185,7 +187,7 @@ async def _tutor_message_for_turn(
 ) -> str | None:
     """A turn's tutor line comes from that turn's own FinalAnswer /
     BaselineTeach ``node_calls`` row — a 'show options' turn has
-    neither, and returns None. Mirrors ``webui/pages/1_Session.py``."""
+    neither, and returns None."""
     for node_name in ("FinalAnswer", "BaselineTeach"):
         call = await node_calls.get_call_for_turn(session_id, turn_index, node_name)
         if call is not None:
@@ -574,7 +576,7 @@ async def _learner_create(request: Request) -> Response:
 
 async def _learner_facts(request: Request) -> Response:
     """The Story view: every learner_facts row for this learner, in
-    order, across every session (memory.py step 9 / webui's 4_Story.py).
+    order, across every session (memory.py step 9).
     LearnerFactStore.list_by_learner passthrough — no computation, the
     plain-language framing is the client's."""
     try:
@@ -601,7 +603,7 @@ async def _learner_facts(request: Request) -> Response:
 
 async def _compare(request: Request) -> Response:
     """Two sessions side by side: their mode, per-turn cost, and
-    transcripts aligned turn by turn (webui's 3_Compare.py). Every value
+    transcripts aligned turn by turn. Every value
     is a store read; nothing here judges which session did better."""
     stores = _stores()
     try:
@@ -655,6 +657,44 @@ async def _compare(request: Request) -> Response:
         return JSONResponse({"error": "no such session"}, status_code=404)
     return JSONResponse(
         {"a": a, "b": b, "mode_differs": a["mode"] != b["mode"]}
+    )
+
+
+async def _evidence(request: Request) -> Response:
+    """Every recorded verification finding, newest first — the Evidence
+    panel. `?source_type=staged_verification` (or `organic_session`)
+    filters. `EvidenceStore.list_all` passthrough; the source_type
+    label is carried verbatim so a staged mechanism test is never shown
+    as anything else."""
+    from probe.models import EvidenceSourceType
+
+    raw = request.query_params.get("source_type")
+    source_type = None
+    if raw is not None:
+        try:
+            source_type = EvidenceSourceType(raw)
+        except ValueError:
+            return JSONResponse(
+                {"error": f"unknown source_type {raw!r}"}, status_code=400
+            )
+    rows = await _stores()["evidence"].list_all(source_type)
+    return JSONResponse(
+        {
+            "records": [
+                {
+                    "id": str(r.id),
+                    "source_type": r.source_type.value,
+                    "part": r.part,
+                    "title": r.title,
+                    "summary": r.summary,
+                    "body": r.body,
+                    "learner_id": str(r.learner_id) if r.learner_id else None,
+                    "session_id": str(r.session_id) if r.session_id else None,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in rows
+            ]
+        }
     )
 
 
@@ -715,6 +755,7 @@ def create_app() -> Starlette:
             "/api/learners/{learner_id}/facts", _learner_facts, methods=["GET"]
         ),
         Route("/api/compare", _compare, methods=["GET"]),
+        Route("/api/evidence", _evidence, methods=["GET"]),
         Mount(
             "/static",
             app=StaticFiles(directory=str(_STATIC_DIR)),

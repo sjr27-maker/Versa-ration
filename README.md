@@ -30,7 +30,7 @@ Every claim in the system is backed by a stored, readable trace — nothing is t
 
 **Languages:** Python
 
-**Platforms:** Streamlit (web UI), Docker / Docker Compose (local dev), Google Cloud Run (deployment)
+**Platforms:** Starlette + a static single-page UI (`probe serve`), Docker / Docker Compose (local dev), Google Cloud Run (deployment)
 
 **Databases:** PostgreSQL 16 with the `pgvector` extension (Cloud SQL in production, Docker locally)
 
@@ -115,9 +115,9 @@ flowchart TD
 
 6. Launch the web UI:
 ```bash
-   uv run probe web
+   uv run probe serve
 ```
-   Opens at `http://localhost:8501`.
+   Opens at `http://localhost:8000`.
 
 ---
 
@@ -157,7 +157,7 @@ No credentials are required to run the automated test suite — it runs entirely
 | Command | Description |
 |---|---|
 | `probe chat --learner <label>` | Start an interactive session |
-| `probe web` | Launch the local web UI |
+| `probe serve` | Launch the web UI (single-page app + Starlette API) |
 | `probe migrate` | Apply pending database migrations |
 | `probe migrate --status` | Show applied/pending migrations without changing anything |
 | `probe consolidate-session <id>` | Run cross-session thinking-style detection for one completed session |

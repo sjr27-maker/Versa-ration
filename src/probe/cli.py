@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import os
 import sys
-from pathlib import Path
 from uuid import UUID
 
 from dotenv import load_dotenv
@@ -184,34 +183,11 @@ async def _run_migrations(status_only: bool, do_baseline: bool) -> None:
         await pool.close()
 
 
-def _web() -> None:
-    """`probe web` — one command to launch the Streamlit UI. Shells out
-    to `streamlit run` rather than importing streamlit here, so this
-    module (and every other CLI command) has no dependency on the web
-    UI even existing; `probe web` is the only path that touches it.
-
-    Binds to the port Cloud Run (or any PaaS) injects via `PORT`, on
-    0.0.0.0 so the container's published port is reachable. Falls back
-    to Streamlit's own default (8501) locally, where PORT is unset, so
-    `probe web` on a workstation is unchanged."""
-    import subprocess
-
-    app_path = Path(__file__).resolve().parent / "webui" / "app.py"
-    port = os.environ.get("PORT", "8501")
-    subprocess.run(
-        [
-            sys.executable, "-m", "streamlit", "run", str(app_path),
-            "--server.port", port,
-            "--server.address", "0.0.0.0",
-        ],
-        check=False,
-    )
-
-
 def _serve(host: str, port: int) -> None:
     """`probe serve` — the calm single-page UI (probe/static/) backed by
     the Starlette API in webserver.py, over the same SessionLoop the CLI
-    drives. Imported lazily so `probe chat` never pulls in Starlette."""
+    drives. Imported lazily so `probe chat` never pulls in Starlette.
+    This is the only web UI; the old Streamlit `probe web` was removed."""
     from probe.webserver import serve
 
     serve(host=host, port=port)
@@ -265,16 +241,18 @@ def main() -> None:
         "it - for a database that already has the full schema but no "
         "schema_migrations ledger (e.g. a hand-migrated dev DB)",
     )
-    subparsers.add_parser(
-        "web",
-        help="launch the local Streamlit web UI",
-    )
     serve_parser = subparsers.add_parser(
         "serve",
-        help="launch the calm single-page UI (Starlette API + probe/static/)",
+        help="launch the calm single-page web UI (Starlette API + probe/static/)",
     )
-    serve_parser.add_argument("--host", default="127.0.0.1")
-    serve_parser.add_argument("--port", type=int, default=8000)
+    # Defaults are deployment-first: bind 0.0.0.0 and take the port from
+    # $PORT (Cloud Run / any PaaS injects it) so the container works with
+    # no extra flags. Locally it's still reachable at localhost:8000;
+    # pass --host 127.0.0.1 to restrict it.
+    serve_parser.add_argument("--host", default="0.0.0.0")
+    serve_parser.add_argument(
+        "--port", type=int, default=int(os.environ.get("PORT", "8000"))
+    )
     args = parser.parse_args()
 
     if args.command == "chat":
@@ -283,8 +261,6 @@ def main() -> None:
         asyncio.run(_consolidate_session(args.session_id, args.stub))
     elif args.command == "migrate":
         asyncio.run(_run_migrations(args.status, args.baseline))
-    elif args.command == "web":
-        _web()
     elif args.command == "serve":
         _serve(args.host, args.port)
     else:

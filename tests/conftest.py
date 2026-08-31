@@ -38,6 +38,7 @@ async def pool():
         # comprehensive (includes the tables migration 032 retires) so
         # a run against a pre-032 schema is cleaned too; every DROP is
         # IF EXISTS.
+        await conn.execute("DROP TABLE IF EXISTS evidence_records CASCADE")
         await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
         await conn.execute("DROP TABLE IF EXISTS turn_diagnostics CASCADE")
         await conn.execute("DROP TABLE IF EXISTS hypothesis_tier_changes CASCADE")
@@ -61,6 +62,7 @@ async def pool():
         await conn.execute("DROP TABLE IF EXISTS concept_prerequisites CASCADE")
         await conn.execute("DROP TABLE IF EXISTS concept_nodes CASCADE")
         await conn.execute("DROP TABLE IF EXISTS concept_graphs CASCADE")
+        await conn.execute("DROP TYPE IF EXISTS evidence_source_type")
         await conn.execute("DROP TYPE IF EXISTS learner_fact_type")
         await conn.execute("DROP TYPE IF EXISTS thinking_style_status")
         await conn.execute("DROP TYPE IF EXISTS option_status")
@@ -91,9 +93,9 @@ async def pool():
 async def clean_pool(pool):
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE node_calls, turn_diagnostics, turns, sessions, learners, "
-            "disambiguation_options, disambiguation_branches, disambiguation_turns, "
-            "learner_facts, thinking_style_candidates "
+            "TRUNCATE evidence_records, node_calls, turn_diagnostics, turns, "
+            "sessions, learners, disambiguation_options, disambiguation_branches, "
+            "disambiguation_turns, learner_facts, thinking_style_candidates "
             "RESTART IDENTITY CASCADE"
         )
     return pool
@@ -102,6 +104,13 @@ async def clean_pool(pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def transcript(clean_pool):
     return TranscriptStore(clean_pool)
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def evidence_store(clean_pool):
+    from probe.evidence import EvidenceStore
+
+    return EvidenceStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")

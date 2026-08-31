@@ -24,10 +24,14 @@ optional overrides for the tier→model mapping in `model_config.py` —
 only needed if the defaults there go stale (Gemini preview model ids
 shift over time).
 
-Run `probe web` for the local Streamlit UI (`src/probe/webui/`) —
-setup, running sessions, and the learner portrait, no auth, local
-only. It's additive: every `probe` CLI command (`chat`, `seed-graph`,
-`review-revisions`, `portrait`) still works exactly as before.
+Run `probe serve` for the web UI — a single-page app
+(`src/probe/static/`) over a small Starlette API (`src/probe/webserver.py`),
+same `SessionLoop` the CLI drives, no auth, local only. Binds `0.0.0.0`
+and reads `$PORT` by default (so the container needs no flags); pass
+`--host 127.0.0.1` / `--port` to override. The old Streamlit UI
+(`probe web`, `src/probe/webui/`) has been removed. Every `probe` CLI
+command (`chat`, `consolidate-session`, `migrate`) still works
+independently of the web UI.
 
 ## Invariants
 
@@ -299,3 +303,31 @@ about a cross-session pattern in exactly the same evidentiary sense
 that later stops matching is evidence the earlier confirmations were
 wrong or the pattern faded, which is itself worth keeping on record,
 not silently removing.
+
+### 11. The evidence store is append-only
+
+`EvidenceStore` (`evidence_records`, migration 033) must never delete
+rows. Concretely:
+
+- No `delete` / `remove` methods on the class.
+- No `DELETE` SQL anywhere in the `evidence` module or its migration.
+- A recorded finding is never edited after insert — it is a historical
+  fact about what a check saw at that moment. A finding that later
+  turns out to have been misleading is corrected by *adding* a new
+  record next to it, not by changing or removing the old one.
+- Verified by the same AST-based check used for invariants 1, 4, 6, 7,
+  8, 9, and 10.
+
+Why: `evidence_records` exists so verification findings survive with
+their context intact — and the load-bearing part of that context is
+`source_type`. A `staged_verification` row was produced by a
+deliberate scripted run and can only show that a *mechanism functions*;
+an `organic_session` row came from real use. If a row could be edited
+or deleted, the record of "what was actually tested, under what
+conditions, and what it showed" — the whole reason to keep this log —
+stops being trustworthy, and a staged mechanism test could quietly be
+made to read like proof the system adapted to a student. The
+`summary` column is where that distinction is kept legible at a glance
+("mechanism verified …", never "adapted to the student" for a staged
+row); that wording is the writer's responsibility, but the row it
+lives on must be immutable for the phrasing to mean anything later.

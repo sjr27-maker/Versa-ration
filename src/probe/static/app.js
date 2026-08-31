@@ -23,11 +23,12 @@ const state = {
   turns: [],            // {q, a, trace, options:[{id,text}], error}
   pendingOptions: [],   // options awaiting a click on the latest turn
   busy: false,
-  panel: null,          // null | 'learners' | 'session' | 'story'
+  panel: null,          // null | 'learners' | 'session' | 'story' | 'evidence'
   learnerId: null,
   priorSessions: [],
   learners: [],
   facts: [],
+  evidence: [],
   consolidateNote: '',
   panelNote: '',
 };
@@ -64,6 +65,7 @@ function render() {
   $('btnLearners').classList.toggle('active', state.panel === 'learners');
   $('btnSession').classList.toggle('active', state.panel === 'session');
   $('btnStory').classList.toggle('active', state.panel === 'story');
+  $('btnEvidence').classList.toggle('active', state.panel === 'evidence');
   $('promptHint').textContent = state.busy ? 'thinking…' : 'enter ↵ to send';
 
   const inner = $('streamInner');
@@ -143,6 +145,7 @@ const DRAWER_TITLE = {
   learners: 'LEARNERS',
   session: 'SESSIONS',
   story: 'LEARNER MEMORY',
+  evidence: 'VERIFICATION EVIDENCE',
 };
 
 function openPanel(name) {
@@ -150,18 +153,21 @@ function openPanel(name) {
   if (state.panel === 'learners') loadLearners();
   if (state.panel === 'session') loadPriorSessions();
   if (state.panel === 'story') loadFacts();
+  if (state.panel === 'evidence') loadEvidence();
   render();
 }
 
 function renderDrawer() {
   const open = state.panel !== null;
   $('drawer').hidden = !open;
+  $('drawer').classList.toggle('wide', open && state.panel === 'evidence');
   if (!open) return;
   $('drawerTitle').textContent = DRAWER_TITLE[state.panel] || 'PANEL';
   const body = $('drawerBody');
   if (state.panel === 'learners') body.innerHTML = learnersHtml();
   else if (state.panel === 'session') body.innerHTML = sessionsHtml();
   else if (state.panel === 'story') body.innerHTML = storyHtml();
+  else if (state.panel === 'evidence') body.innerHTML = evidenceHtml();
   wireDrawer(body);
 }
 
@@ -395,6 +401,67 @@ async function loadFacts() {
     if (res.ok) {
       state.facts = (await res.json()).facts || [];
       if (state.panel === 'story') renderDrawer();
+    }
+  } catch (_e) {
+    /* non-fatal */
+  }
+}
+
+/* --- verification evidence (evidence_records) --- */
+
+const EV_PART_LABEL = {
+  part_1_within_session: 'PART 1 · within-session adaptation',
+  part_2_cross_session: 'PART 2 · cross-session memory',
+  part_3_thinking_style: 'PART 3 · thinking-style mechanism',
+};
+
+function evidenceHtml() {
+  const staged = state.evidence.filter((r) => r.source_type === 'staged_verification');
+  const note =
+    '<div class="ev-note"><b>staged_verification</b> rows are deliberate ' +
+    'scripted runs. They can show a <b>mechanism functions</b> — never ' +
+    'that the system adapted to a real student. A confirmed thinking ' +
+    'style and multi-session organic adaptation need real elapsed usage, ' +
+    'not a testing pass.</div>';
+  if (!state.evidence.length) {
+    return note + '<div class="muted">No verification findings recorded yet.</div>';
+  }
+  const cards = state.evidence
+    .map((r) => {
+      const when = new Date(r.created_at).toLocaleString([], {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+      const srcCls = r.source_type === 'staged_verification' ? 'staged' : 'organic';
+      const partLabel = EV_PART_LABEL[r.part] || r.part;
+      let bodyStr = '';
+      try { bodyStr = JSON.stringify(r.body, null, 2); } catch (_e) { bodyStr = String(r.body); }
+      return (
+        '<div class="ev-card">' +
+        '<span class="ev-src ' + srcCls + '">' + escapeHtml(r.source_type) + '</span>' +
+        '<div class="meta">' + escapeHtml(partLabel) + ' · ' + when + '</div>' +
+        '<div class="ev-title">' + escapeHtml(r.title) + '</div>' +
+        '<div class="ev-summary">' + escapeHtml(r.summary) + '</div>' +
+        '<details><summary>evidence (' + bodyStr.length + ' chars)</summary>' +
+        '<pre>' + escapeHtml(bodyStr) + '</pre></details>' +
+        '</div>'
+      );
+    })
+    .join('');
+  return (
+    note +
+    '<div class="muted" style="margin-bottom:12px">' +
+    state.evidence.length + ' finding' + (state.evidence.length === 1 ? '' : 's') +
+    ' · ' + staged.length + ' staged</div>' +
+    cards
+  );
+}
+
+async function loadEvidence() {
+  try {
+    const res = await fetch('/api/evidence');
+    if (res.ok) {
+      state.evidence = (await res.json()).records || [];
+      if (state.panel === 'evidence') renderDrawer();
     }
   } catch (_e) {
     /* non-fatal */
@@ -909,6 +976,7 @@ $('learnerChip').addEventListener('input', () => {
 $('btnLearners').onclick = () => openPanel('learners');
 $('btnSession').onclick = () => openPanel('session');
 $('btnStory').onclick = () => openPanel('story');
+$('btnEvidence').onclick = () => openPanel('evidence');
 $('drawerClose').onclick = () => {
   state.panel = null;
   render();

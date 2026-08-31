@@ -165,7 +165,10 @@ def test_create_app_serves_the_spa_and_404s_unknown_session(monkeypatch):
     with TestClient(webserver.create_app()) as client:
         root = client.get("/")
         assert root.status_code == 200
-        assert "<title>probe</title>" in root.text
+        # the single-page shell (title string is mid-rename probe->versa,
+        # so assert on structure, not the brand word)
+        assert root.headers["content-type"].startswith("text/html")
+        assert '<script src="/static/app.js">' in root.text
         assert client.get("/static/app.js").status_code == 200
         assert client.get("/api/session/not-a-uuid").status_code == 404
 

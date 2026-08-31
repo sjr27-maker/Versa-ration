@@ -27,11 +27,28 @@ from google.genai import types
 EMBEDDING_DIM = 768
 
 
+# gemini-embedding-001 is an ASYMMETRIC retrieval model: the query and
+# the stored document must be embedded with matching task_types for
+# cosine similarity to land where it should. Measured on real data
+# (scratchpad diagnostic, 2026-09-01): a genuine paraphrase match rose
+# from 0.76 -> 0.80 just by switching an untyped embed pair to
+# RETRIEVAL_QUERY / RETRIEVAL_DOCUMENT. `None` reproduces the old
+# untyped behaviour exactly (and is what StubEmbeddingClient ignores).
+TASK_QUERY = "RETRIEVAL_QUERY"
+TASK_DOCUMENT = "RETRIEVAL_DOCUMENT"
+TASK_SIMILARITY = "SEMANTIC_SIMILARITY"
+
+
 class EmbeddingClient(Protocol):
     """Async embedding interface. Nodes/stores depend on this, not on
-    a specific provider — same split as LLMClient/GeminiLLMClient."""
+    a specific provider — same split as LLMClient/GeminiLLMClient.
 
-    async def embed(self, text: str) -> list[float]: ...
+    `task_type` (see TASK_* above) is the retrieval role of `text`:
+    the memory layer's search query passes TASK_QUERY, a fact being
+    stored passes TASK_DOCUMENT, and a symmetric candidate-vs-candidate
+    compare passes TASK_SIMILARITY. `None` = untyped (back-compat)."""
+
+    async def embed(self, text: str, *, task_type: str | None = None) -> list[float]: ...
 
 
 class StubEmbeddingClient:
@@ -54,7 +71,10 @@ class StubEmbeddingClient:
         self.canned = canned or {}
         self.texts: list[str] = []
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, *, task_type: str | None = None) -> list[float]:
+        # task_type is deliberately ignored: the stub's whole point is a
+        # deterministic text -> vector map, so the same text must embed
+        # identically regardless of retrieval role.
         self.texts.append(text)
         if text in self.canned:
             return self.canned[text]
@@ -78,11 +98,15 @@ class GeminiEmbeddingClient:
         self._client = client
         self._model = model
 
-    async def embed(self, text: str) -> list[float]:
+    async def embed(self, text: str, *, task_type: str | None = None) -> list[float]:
+        config = types.EmbedContentConfig(
+            output_dimensionality=EMBEDDING_DIM,
+            task_type=task_type,  # None -> the API's untyped default
+        )
         response = await self._client.aio.models.embed_content(
             model=self._model,
             contents=text,
-            config=types.EmbedContentConfig(output_dimensionality=EMBEDDING_DIM),
+            config=config,
         )
         return list(response.embeddings[0].values)
 

@@ -323,3 +323,40 @@ class ThinkingStyleCandidate(BaseModel):
     status: ThinkingStyleStatus = ThinkingStyleStatus.CANDIDATE
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class EvidenceSourceType(str, Enum):
+    # A deliberate scripted run to exercise a code path — proves a
+    # mechanism functions, never that the system adapted to a real
+    # student.
+    STAGED_VERIFICATION = "staged_verification"
+    # A finding lifted from a real, organic student session.
+    ORGANIC_SESSION = "organic_session"
+
+
+class EvidenceRecord(BaseModel):
+    """One recorded verification finding (evidence_records, migration
+    033). `source_type` is load-bearing: it keeps a staged mechanism
+    test visibly separate from evidence produced by real usage, so the
+    Evidence page can never present the former as the latter.
+
+    `body` is the structured verbatim evidence for this finding
+    (branches offered, facts written, `turn_diagnostics` fields,
+    responses, consolidation output, …). `summary` is the one-line read
+    — for `STAGED_VERIFICATION` it must use "mechanism verified"
+    language, never "adapted to the student" (enforced by the writer,
+    not the schema).
+
+    Append-only (CLAUDE.md invariant 11): a finding is never edited or
+    removed once written.
+    """
+
+    id: UUID = Field(default_factory=uuid4)
+    source_type: EvidenceSourceType
+    part: str
+    title: str
+    summary: str
+    body: dict = Field(default_factory=dict)
+    learner_id: UUID | None = None
+    session_id: UUID | None = None
+    created_at: datetime = Field(default_factory=_utcnow)

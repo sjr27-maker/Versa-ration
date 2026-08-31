@@ -43,6 +43,7 @@ from probe.disambiguate import (
     FinalAnswer,
     build_typed_past_note,
 )
+from probe import embeddings as _embeddings
 from probe.embeddings import EmbeddingClient
 from probe.llm import LLMClient, ModelTierClients
 from probe.memory import (
@@ -720,7 +721,13 @@ class SessionLoop:
         path_summary = await self._call_node(
             self.summarize_session_path, session_id, last_turn_index, facts=facts,
         )
-        embedding = await self._embedding_client.embed(path_summary.summary)
+        # Symmetric compare: this session's path summary against other
+        # sessions' path summaries — same kind of text on both sides, so
+        # SEMANTIC_SIMILARITY, not the QUERY/DOCUMENT asymmetry the
+        # fact search uses.
+        embedding = await self._embedding_client.embed(
+            path_summary.summary, task_type=_embeddings.TASK_SIMILARITY
+        )
 
         nearest = await self._thinking_styles.search_similar(learner_id, embedding, limit=1)
         if nearest:
