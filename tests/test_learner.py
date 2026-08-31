@@ -41,12 +41,6 @@ async def test_resolve_by_unknown_uuid_exits_rather_than_guessing(learner_store)
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_session_rejected_without_a_valid_learner_id(transcript, concept_graph_id):
+async def test_session_rejected_without_a_valid_learner_id(transcript):
     with pytest.raises(asyncpg.ForeignKeyViolationError):
-        await transcript.create_session(uuid4(), concept_graph_id)
-
-
-@pytest.mark.asyncio(loop_scope="session")
-async def test_session_rejected_without_a_valid_concept_graph_id(transcript, learner_id):
-    with pytest.raises(asyncpg.ForeignKeyViolationError):
-        await transcript.create_session(learner_id, uuid4())
+        await transcript.create_session(uuid4())

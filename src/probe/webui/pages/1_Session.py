@@ -1,19 +1,20 @@
 """probe web — Session page: chat on the left, machine state on the
-right. Every number on the right comes from a store read or from
-`SessionLoop`/node_calls output — nothing is computed here beyond
-display formatting (rounding, sorting, grouping by an already-present
-field).
+right. The right side is two panels only now that the full reasoning
+path is gone: the **Story** panel (this session's disambiguation
+branches and how each turn resolved) and the **Diagnostics** strip
+(latency, call count, the MAX_CALLS_PER_TURN guardrail, warnings, and
+the memory layer's skip-visibility fields). Every value comes from a
+store read or from node_calls output — nothing is computed here beyond
+display formatting.
 """
 
 from __future__ import annotations
 
 import streamlit as st
 
-from probe.ablation import ReasoningMode
-from probe.hypothesis_generator import build_branch_path
+from probe.baseline import MAX_CALLS_PER_TURN
 from probe.loop import SessionLoop
-from probe.models import BranchStatus, OptionStatus, Tier
-from probe.nodes import MAX_CALLS_PER_TURN, SessionMissingTopicError
+from probe.models import BranchStatus, OptionStatus
 from probe.webui.backend import (
     get_embedding_client,
     get_stores,
@@ -35,14 +36,12 @@ stores = get_stores()
 
 # The SessionLoop instance is cached across reruns (Streamlit reruns
 # the whole script every interaction): its turn-to-turn state
-# (self._last_teach_message, self._generation_width,
-# self._prior_generation_id, self._consecutive_ungrounded_turns) is
-# in-memory only, same as the CLI's run_interactive — recreating the
-# loop between turns would silently reset all of it.
+# (self._prior_disambiguation_turn_id) is in-memory only, same as the
+# CLI's run_interactive — recreating the loop between turns would
+# silently reset it.
 use_stub = st.session_state.get("use_stub", False)
-# Fixed at session creation (app.py) and never re-read after — a
-# session's config is set-once (TranscriptStore.set_ablation_config
-# raises past turn 0), so caching it alongside the loop instance below
+# Fixed at session creation and never re-read after — a session's
+# config is set-once, so caching it alongside the loop instance below
 # is exactly as safe as caching the loop itself.
 ablation_config = run_async(stores.transcript.get_ablation_config(session_id))
 if (
@@ -54,16 +53,10 @@ if (
     embedding_client = get_embedding_client(use_stub)
     progress, on_node_start = make_progress_tracker()
     st.session_state["loop"] = SessionLoop(
-        hypothesis_store=stores.hypotheses,
         transcript=stores.transcript,
         node_calls=stores.node_calls,
-        concept_graph=stores.concept_graph,
-        learner_overlay=stores.learner_overlay,
-        revision_store=stores.revisions,
         llm=tiers.fast,
         model_tier_clients=tiers,
-        branch_store=stores.branches,
-        option_store=stores.options,
         diagnostics_store=stores.diagnostics,
         on_node_start=on_node_start,
         ablation_config=ablation_config,
@@ -78,69 +71,53 @@ if (
 loop: SessionLoop = st.session_state["loop"]
 progress: dict = st.session_state["progress"]
 
+
+def _tutor_message_for_turn(turn_index: int) -> str | None:
+    for node_name in ("FinalAnswer", "BaselineTeach"):
+        call = run_async(
+            stores.node_calls.get_call_for_turn(session_id, turn_index, node_name)
+        )
+        if call is not None:
+            return str(call.output_json)
+    return None
+
+
 if not st.session_state.get("chat_history"):
     # Reconstruct from the durable record: student turns from `turns`,
-    # tutor messages from that turn's own Teach node_calls row.
+    # tutor messages from that turn's own FinalAnswer/BaselineTeach
+    # node_calls row (a "show options" turn has neither — nothing to
+    # append for it).
     history: list[tuple[str, str]] = []
     for t in run_async(stores.transcript.list_turns(session_id)):
         history.append(("student", t.text))
-        teach_call = run_async(
-            stores.node_calls.get_call_for_turn(session_id, t.turn_index, "Teach")
-        )
-        if teach_call is not None:
-            history.append(("tutor", str(teach_call.output_json)))
+        tutor = _tutor_message_for_turn(t.turn_index)
+        if tutor is not None:
+            history.append(("tutor", tutor))
     st.session_state["chat_history"] = history
 
 st.title("probe — session")
-graph_id = run_async(stores.transcript.get_concept_graph_id(session_id))
-topic = None
-if graph_id is not None:
-    meta = run_async(stores.concept_graph.get_graph(graph_id))
-    topic = meta.topic if meta is not None else None
-st.caption(
-    f"Learner: {learner.label or learner.id}  ·  topic: {topic or '(not yet attached)'}"
-)
+st.caption(f"Learner: {learner.label or learner.id}")
 
-if ablation_config.reasoning_mode is ReasoningMode.DISAMBIGUATE:
-    st.info(
-        "⚗ minimal_branch (ReasoningMode.DISAMBIGUATE) — AssessAndBranch "
-        "→ [options] → FinalAnswer, at most 3 calls per exchange. No "
-        "concept graph/portrait/Plan this session."
-    )
-elif ablation_config.is_full_bypass:
-    st.warning("⚗ BASELINE — plain LLM, every subsystem off. Fixed for this session.")
+if ablation_config.is_full_bypass:
+    st.warning("⚗ BASELINE — plain LLM, one call per turn. Fixed for this session.")
 else:
-    _off = [
-        name
-        for name, enabled in [
-            ("portrait", ablation_config.enable_portrait),
-            ("concept_graph", ablation_config.enable_concept_graph),
-            ("diagnose", ablation_config.enable_diagnose),
-            ("planner", ablation_config.enable_planner),
-            ("branches", ablation_config.enable_branches),
-            ("options", ablation_config.enable_options),
-        ]
-        if not enabled
-    ]
     st.info(
-        "⚗ Ablation config (fixed for this session): "
-        + ("full system — everything on" if not _off else f"off: {', '.join(_off)}")
+        "⚗ minimal_branch (SessionMode.MINIMAL_BRANCH) — AssessAndBranch "
+        "→ [options] → FinalAnswer, at most 3 calls per exchange, plus "
+        "the memory layer."
     )
 
 # The memory layer's explicit, unambiguous consolidation trigger (see
-# memory.py steps 6-8 / SessionLoop.consolidate_session) — deliberately
-# has no turn-count gate the way run_interactive's own CLI-exit
-# auto-trigger does: a person clicking this has decided the session is
-# done, which is not a guess the way "the CLI process happened to
-# exit" is. A no-op (reported plainly) for a session with no
-# learner_facts at all — most commonly a full-system session, since
-# only ReasoningMode.DISAMBIGUATE turns ever write one.
+# memory.py steps 6-8 / SessionLoop.consolidate_session) — a person
+# clicking this has decided the session is done. A no-op (reported
+# plainly) for a session with no learner_facts (a BASELINE session, or
+# one that never resolved anything).
 if st.button("End session & consolidate"):
     consolidation_result = run_async(loop.consolidate_session(session_id))
     if consolidation_result is None:
         st.info(
             "Nothing to consolidate — this session wrote no learner_facts "
-            "(not a minimal_branch session, or it never resolved anything)."
+            "(a BASELINE session, or it never resolved anything)."
         )
     else:
         st.success(
@@ -152,11 +129,10 @@ if st.button("End session & consolidate"):
 
 left, right = st.columns([3, 2])
 
+
 def _run_turn(text: str, progress_placeholder, selected_option_id=None) -> None:
-    """Shared by typed input and option-button clicks — both are just
-    a message plus, for a click, which option produced it. A click's
-    `text` is that option's own label: the click IS the turn's
-    content, recorded exactly like typed text would be."""
+    """Shared by typed input and option-button clicks — both are just a
+    message plus, for a click, which option produced it."""
     turn_index = st.session_state.get("turn_index", 0)
     progress["node"] = None
     progress_placeholder.markdown("⏳ starting…")
@@ -166,8 +142,6 @@ def _run_turn(text: str, progress_placeholder, selected_option_id=None) -> None:
             progress,
             progress_placeholder,
         )
-    except SessionMissingTopicError as exc:
-        st.error(f"Session has no topic attached: {exc}")
     except Exception as exc:  # noqa: BLE001 — surfaced to the user, not swallowed
         st.error(f"Turn failed: {exc}")
     else:
@@ -187,38 +161,19 @@ with left:
             with st.chat_message("user" if role == "student" else "assistant"):
                 st.write(text)
 
-    # Options pending from the most recent turn's generation — both
-    # channels stay enabled: clicking one here satisfies its branch
-    # directly (no LLM call); typing in the box below instead still
-    # gets a chance via CheckEvidence (full system) or is treated as
-    # typing past the options (minimal_branch — see disambiguate.py).
-    # Only ever the *latest* generation's still-open options: resolve()
-    # (full system) or a click/typed-past turn (minimal_branch)
-    # supersedes whatever's left the moment the next turn starts.
-    #
-    # Two entirely separate stores/tables back this, by reasoning_mode
-    # (see disambiguate.py's module docstring for why: the tree-based
-    # options table has a hard FK to the tree-based branches table, so
-    # minimal_branch's flat branches/options cannot live there) — reads
-    # the same `Option`/`OptionStatus` shape either way, so the
-    # rendering below needs no branch of its own.
+    # Options pending from the most recent disambiguation turn — both
+    # channels stay open: clicking one here resolves its branch
+    # directly (no LLM call); typing in the box instead is treated as
+    # typing past the options (see disambiguate.py). Only ever the
+    # latest turn's still-open options.
     pending_options = []
-    if ablation_config.reasoning_mode is ReasoningMode.DISAMBIGUATE:
+    if not ablation_config.is_full_bypass:
         latest_disambiguation_turn = run_async(
             stores.disambiguation.get_latest_turn(session_id)
         )
         if latest_disambiguation_turn is not None:
             all_options = run_async(
                 stores.disambiguation.list_options_for_turn(latest_disambiguation_turn.id)
-            )
-            pending_options = [o for o in all_options if o.status is OptionStatus.OPEN]
-    else:
-        latest_generation_for_options = run_async(
-            stores.branches.get_latest_generation(session_id)
-        )
-        if latest_generation_for_options is not None:
-            all_options = run_async(
-                stores.options.list_by_generation(latest_generation_for_options.id)
             )
             pending_options = [o for o in all_options if o.status is OptionStatus.OPEN]
 
@@ -237,201 +192,44 @@ with left:
 latest_turn_index = st.session_state.get("turn_index", 0) - 1
 
 with right:
-    tab_hyp, tab_branch, tab_decision, tab_diag = st.tabs(
-        ["Hypotheses", "Branch tree", "Decision trace", "Diagnostics"]
-    )
+    tab_story, tab_diag = st.tabs(["Story", "Diagnostics"])
 
-    # --- 1. Hypotheses -------------------------------------------------
-    with tab_hyp:
-        tier_counts = {
-            tier.value: len(run_async(stores.hypotheses.list_by_learner(learner.id, tier=tier)))
-            for tier in Tier
-        }
-        st.caption(" · ".join(f"{k}: {v}" for k, v in tier_counts.items()))
-
-        active = run_async(
-            stores.hypotheses.list_by_learner(learner.id, tier=Tier.ACTIVE)
-        )
-        by_layer: dict[str, list] = {}
-        for h in active:
-            by_layer.setdefault(h.layer.value, []).append(h)
-
-        for layer_name in sorted(by_layer):
-            st.markdown(f"**{layer_name}**")
-            for h in sorted(by_layer[layer_name], key=lambda x: -x.probability):
-                st.progress(
-                    h.probability,
-                    text=f"{h.statement}  (p={h.probability:.2f}, c={h.confidence:.2f})",
-                )
-                dated = [r for r in h.evidence_refs if r.resulting_probability is not None]
-                dated.sort(key=lambda r: r.timestamp)
-                if len(dated) >= 2:
-                    delta = dated[-1].resulting_probability - dated[-2].resulting_probability
-                    arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "→")
-                    st.caption(f"{arrow} Δ{delta:+.2f} since previous update")
-                tier_changes = run_async(stores.hypotheses.list_tier_changes(h.id))
-                if tier_changes:
-                    last_change = tier_changes[-1]
-                    if last_change.new_tier is Tier.ACTIVE and last_change.old_tier in (
-                        Tier.DORMANT,
-                        Tier.BACKGROUND,
-                    ):
-                        st.caption(f"↩ resurrected from {last_change.old_tier.value}")
-                with st.expander("Evidence"):
-                    for ref in h.evidence_refs:
-                        turn = run_async(stores.transcript.get_turn(ref.turn_id))
-                        st.write(
-                            f"- turn {turn.turn_index if turn else '?'}: "
-                            f"{turn.text if turn else '(turn not found)'}"
-                        )
-
-    # --- 2. Branch tree --------------------------------------------------
-    with tab_branch:
-        resolution_call = run_async(
-            stores.node_calls.get_latest_call(session_id, "BranchResolve")
-        )
-        if resolution_call is not None:
-            status = resolution_call.output_json.get("status")
-            source = resolution_call.output_json.get("source")
-            if status == "matched":
-                # Distinct labels on purpose: a click confirms the student
-                # picked an offered option, not that the system predicted
-                # them — these must never read as the same kind of "right."
-                label = (
-                    "MATCHED (option click)"
-                    if source == "option_click"
-                    else "MATCHED (predicted)"
-                )
-                st.success(f"Previous turn: {label}")
-            elif status == "unmatched":
-                st.error("⚠ Previous turn: NOTHING MATCHED")
-
-        generation = run_async(stores.branches.get_latest_generation(session_id))
-        if generation is None:
-            st.write("No branches generated yet.")
+    # --- 1. Story -----------------------------------------------------
+    with tab_story:
+        if ablation_config.is_full_bypass:
+            st.write("BASELINE sessions have no branches — see Diagnostics.")
         else:
-            branches = run_async(stores.branches.list_by_generation(generation.id))
-            by_parent: dict = {}
-            for b in branches:
-                by_parent.setdefault(b.parent_id, []).append(b)
-
-            options_for_generation = run_async(
-                stores.options.list_by_generation(generation.id)
-            )
-            option_text_by_branch = {
-                o.branch_id: o.text for o in options_for_generation
-            }
-
-            status_marker = {
-                BranchStatus.MATCHED: "✅",
-                BranchStatus.UNMATCHED: "❌",
-                BranchStatus.SUPERSEDED: "⏹",
-                BranchStatus.OPEN: "•",
-            }
-            selected_id = generation.selected_branch_id
-
-            def render(parent_id, indent):
-                for b in by_parent.get(parent_id, []):
-                    prefix = "  " * indent
-                    weight = "**" if b.depth == 0 else ""
-                    star = "⭐ " if b.id == selected_id else ""
-                    awaiting = b.requires_evidence and not b.evidence_satisfied
-                    evidence_marker = "⏳ " if awaiting else ("🔓 " if b.requires_evidence else "")
-                    st.markdown(
-                        f"{prefix}{status_marker[b.status]} {star}{evidence_marker}"
-                        f"{weight}[{b.depth_label}] {b.statement}{weight}  \n"
-                        f"{prefix}　plausibility={b.plausibility:.2f} · "
-                        f"predicts: _{b.predicted_next_turn}_"
-                    )
-                    if b.requires_evidence:
-                        st.caption(
-                            f"{prefix}　requires: {b.requires_evidence}"
-                            + (
-                                f"  ·  option shown: “{option_text_by_branch[b.id]}”"
-                                if b.id in option_text_by_branch
-                                else ""
-                            )
-                        )
-                    render(b.id, indent + 1)
-
-            render(None, 0)
-            if any(b.requires_evidence and not b.evidence_satisfied for b in branches):
+            latest = run_async(stores.disambiguation.get_latest_turn(session_id))
+            if latest is None:
+                st.write("No disambiguation branches generated yet this session.")
+            else:
+                branches = run_async(
+                    stores.disambiguation.list_branches_for_turn(latest.id)
+                )
+                options = run_async(
+                    stores.disambiguation.list_options_for_turn(latest.id)
+                )
+                option_text_by_branch = {o.branch_id: o.text for o in options}
+                status_marker = {
+                    BranchStatus.MATCHED: "✅",
+                    BranchStatus.SUPERSEDED: "⏹",
+                    BranchStatus.OPEN: "•",
+                    BranchStatus.UNMATCHED: "❌",
+                }
                 st.caption(
-                    "⏳ = awaiting evidence (held, not expanded)  ·  "
-                    "🔓 = evidence already satisfied"
+                    f"latest turn {latest.turn_index} · "
+                    + ("branched" if latest.needs_branches else "answered directly")
                 )
-
-            if selected_id is not None:
-                path = build_branch_path(branches, selected_id)
-                st.markdown("**⭐ Selected path (root → selected)**")
-                st.markdown(
-                    " → ".join(f"[{b.depth_label}] {b.statement}" for b in path)
-                )
-                if generation.selection_rationale:
-                    st.caption(f"Why: {generation.selection_rationale}")
-
-            if generation.path_requirement is not None:
-                pr = generation.path_requirement
-                st.markdown("**Derived PathRequirement (what Teach was told)**")
-                st.write(f"Believes: {pr.current_belief or '_(none)_'}")
-                st.write(f"Needs: {pr.needed or '_(none)_'}")
-                st.write(f"Scope: {pr.scope or '_(none)_'}")
-                if pr.must_not_assume:
-                    st.warning(
-                        "Must NOT assume:\n"
-                        + "\n".join(f"- {item}" for item in pr.must_not_assume)
+                if not latest.needs_branches:
+                    st.write("The last message was judged unambiguous — answered directly.")
+                for b in branches:
+                    st.markdown(
+                        f"{status_marker.get(b.status, '•')} {b.statement}"
                     )
+                    if b.id in option_text_by_branch:
+                        st.caption(f"　option shown: “{option_text_by_branch[b.id]}”")
 
-        generation_call = run_async(
-            stores.node_calls.get_latest_call(session_id, "BranchGenerate")
-        )
-        if generation_call is not None:
-            notes = [
-                n
-                for n in generation_call.output_json.get("redundancy_notes", [])
-            ]
-            if notes:
-                with st.expander(f"Redundancy check ({len(notes)} branch(es) cleared it)"):
-                    for note in notes:
-                        st.write(f"- {note}")
-
-    # --- 3. Decision trace -------------------------------------------------
-    with tab_decision:
-        plan_call = (
-            run_async(stores.node_calls.get_call_for_turn(session_id, latest_turn_index, "Plan"))
-            if latest_turn_index >= 0
-            else None
-        )
-        if plan_call is None:
-            st.write("No Plan call yet this session.")
-        else:
-            st.caption(
-                f"generation_width={plan_call.input_json.get('generation_width')}  ·  "
-                f"exploration_target="
-                f"{plan_call.input_json.get('exploration_target') or 'none available'}"
-            )
-            winner_action = plan_call.output_json["winner"]["action"]
-            if plan_call.output_json.get("argmax_changes_without_information_value"):
-                st.warning("Winner would change if information_value were zeroed.")
-            rows = []
-            for score in plan_call.output_json["scores"]:
-                rows.append(
-                    {
-                        "action": score["candidate"]["action"],
-                        "winner": "🏆" if score["candidate"]["action"] == winner_action else "",
-                        "learning_value": round(score["learning_value"], 3),
-                        "information_value": round(score["information_value"], 3),
-                        "long_term_value": round(score["long_term_value"], 3),
-                        "time_cost": round(score["time_cost"], 3),
-                        "cognitive_cost": round(score["cognitive_cost"], 3),
-                        "frustration_risk": round(score["frustration_risk"], 3),
-                        "total": round(score["total"], 3),
-                        "flags": ", ".join(score.get("flags", [])),
-                    }
-                )
-            st.dataframe(rows, hide_index=True)
-
-    # --- 4. Diagnostics --------------------------------------------------
+    # --- 2. Diagnostics ---------------------------------------------------
     with tab_diag:
         diagnostics = (
             run_async(stores.diagnostics.get_for_turn(session_id, latest_turn_index))
@@ -448,61 +246,27 @@ with right:
                 f"{'EXCEEDED' if diagnostics.guardrail_fired else 'ok'} ({MAX_CALLS_PER_TURN})",
             )
             cols[2].metric("Duration", f"{diagnostics.duration_ms:.0f} ms")
-            if diagnostics.inferred_topic is not None:
-                st.info(
-                    f"AttachTopic inferred: **{diagnostics.inferred_topic}** "
-                    f"({'seeded a fresh graph' if diagnostics.topic_seeded_new else 'resumed an existing graph'})"
-                )
-            if diagnostics.entropy_bits is not None:
-                st.caption(f"entropy_bits: {diagnostics.entropy_bits:.2f}")
+            st.caption(f"retries this turn: {diagnostics.retry_count}")
             st.markdown("**Calls by node**")
             st.json(diagnostics.node_call_counts)
             if diagnostics.teach_failed:
-                st.error("Teach failed this turn — no real teaching content was produced.")
-            if diagnostics.options_missed:
-                st.error(
-                    "⚠ options_missed — the student typed past the prior turn's "
-                    "options without satisfying any of them. Treat this as a "
-                    "signal the branch/option set was wrong, not that the "
-                    "student was uncooperative."
+                st.error("The response call failed this turn — no real answer was produced.")
+            if diagnostics.branching_skipped_by_memory:
+                st.success(
+                    "⚡ branching skipped by memory — a past fact "
+                    f"(`{diagnostics.matched_fact_id}`) was confirmed to "
+                    "resolve this message, so AssessAndBranch never ran."
                 )
-            if diagnostics.current_belief_unsupported:
-                st.error(
-                    "⚠ current_belief_unsupported — DerivePath's current_belief "
-                    "shares content with the predicted reaction or proposed "
-                    "action rationale but nothing the student actually said. "
-                    "Teach may have affirmed something as said that wasn't — "
-                    "check this turn's tutor message."
+            elif diagnostics.memory_match_found:
+                st.info(
+                    "Memory match found (vector search cleared the "
+                    "threshold) but "
+                    + (
+                        "the confirmation call said it does not resolve this message."
+                        if not diagnostics.memory_match_confirmed_resolution
+                        else "confirmed."
+                    )
                 )
-            if diagnostics.explicit_request_present:
-                if diagnostics.explicit_request_unaddressed:
-                    st.error(
-                        "⚠ explicit_request_unaddressed — the student's "
-                        f"explicit request (**{diagnostics.explicit_request_what}**) "
-                        "was not found worked out in Teach's response: either "
-                        "never mentioned, or only mentioned in a sentence that "
-                        "reads as deferring it to a future turn. Check this "
-                        "turn's tutor message."
-                    )
-                else:
-                    st.success(
-                        f"Explicit request detected and addressed: "
-                        f"**{diagnostics.explicit_request_what}**"
-                    )
-            if diagnostics.prior_reference_detected:
-                if diagnostics.prior_reference_unaddressed:
-                    st.error(
-                        "⚠ prior_reference_unaddressed — the student appeared "
-                        "to reference something from earlier this session, "
-                        "but neither the example nor the analogy tracked "
-                        "from the immediately preceding turn appears in "
-                        "Teach's response. Check whether it introduced a "
-                        "new framing instead of naming what was referenced."
-                    )
-                else:
-                    st.success(
-                        "Prior reference detected and named in Teach's response."
-                    )
             if diagnostics.warnings:
                 st.markdown("**Warnings**")
                 for w in diagnostics.warnings:

@@ -8,7 +8,6 @@ import json
 
 import pytest
 
-from probe.ablation import AblationConfig, ReasoningMode
 from probe.llm import StubLLMClient
 from probe.loop import SessionLoop
 from probe.memory import MemoryConfig
@@ -16,19 +15,13 @@ from probe.models import ThinkingStyleStatus
 
 
 def _make_loop(
-    store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-    disambiguation_store, learner_fact_store, thinking_style_store, embedding_client,
-    llm, min_turns,
+    transcript, node_calls, disambiguation_store, learner_fact_store,
+    thinking_style_store, embedding_client, llm, min_turns,
 ):
     return SessionLoop(
-        hypothesis_store=store,
         transcript=transcript,
         node_calls=node_calls,
-        concept_graph=concept_graph,
-        learner_overlay=learner_overlay,
-        revision_store=revision_store,
         llm=llm,
-        ablation_config=AblationConfig(reasoning_mode=ReasoningMode.DISAMBIGUATE),
         disambiguation_store=disambiguation_store,
         learner_fact_store=learner_fact_store,
         thinking_style_store=thinking_style_store,
@@ -51,8 +44,7 @@ def _scripted_input(monkeypatch, messages: list[str]):
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_below_threshold_does_not_auto_consolidate(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     learner_fact_store, thinking_style_store, embedding_client, monkeypatch,
 ):
     llm = StubLLMClient(
@@ -63,21 +55,19 @@ async def test_below_threshold_does_not_auto_consolidate(
         }
     )
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, learner_fact_store, thinking_style_store, embedding_client,
-        llm, min_turns=2,
+        transcript, node_calls, disambiguation_store, learner_fact_store,
+        thinking_style_store, embedding_client, llm, min_turns=2,
     )
     _scripted_input(monkeypatch, ["only one message"])
 
-    await loop.run_interactive(learner_id, None)
+    await loop.run_interactive(learner_id)
 
     assert await thinking_style_store.list_by_learner(learner_id) == []
 
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_at_or_above_threshold_auto_consolidates(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     learner_fact_store, thinking_style_store, embedding_client, monkeypatch,
 ):
     llm = StubLLMClient(
@@ -89,13 +79,12 @@ async def test_at_or_above_threshold_auto_consolidates(
         }
     )
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, learner_fact_store, thinking_style_store, embedding_client,
-        llm, min_turns=2,
+        transcript, node_calls, disambiguation_store, learner_fact_store,
+        thinking_style_store, embedding_client, llm, min_turns=2,
     )
     _scripted_input(monkeypatch, ["first message", "second message"])
 
-    await loop.run_interactive(learner_id, None)
+    await loop.run_interactive(learner_id)
 
     candidates = await thinking_style_store.list_by_learner(learner_id)
     assert len(candidates) == 1
@@ -105,8 +94,7 @@ async def test_at_or_above_threshold_auto_consolidates(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_explicit_consolidate_session_ignores_turn_count(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     learner_fact_store, thinking_style_store, embedding_client,
 ):
     """The standalone command / web UI button are deliberate,
@@ -121,11 +109,10 @@ async def test_explicit_consolidate_session_ignores_turn_count(
         }
     )
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, learner_fact_store, thinking_style_store, embedding_client,
-        llm, min_turns=1000,  # would never auto-trigger
+        transcript, node_calls, disambiguation_store, learner_fact_store,
+        thinking_style_store, embedding_client, llm, min_turns=1000,
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     await loop.handle_turn(session_id, 0, "one single turn")
 
     result = await loop.consolidate_session(session_id)

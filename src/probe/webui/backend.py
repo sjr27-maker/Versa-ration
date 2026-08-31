@@ -34,8 +34,6 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from probe.audit import NodeCallStore, TranscriptStore
-from probe.branches import BranchStore
-from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
 from probe.disambiguate import DisambiguationStore
@@ -47,10 +45,6 @@ from probe.embeddings import (
 from probe.learner import LearnerStore
 from probe.llm import ModelTierClients, StubLLMClient, build_tier_clients
 from probe.memory import LearnerFactStore, ThinkingStyleStore
-from probe.options import OptionStore
-from probe.overlay import LearnerOverlay
-from probe.revision import WorldModelRevisionStore
-from probe.store import HypothesisStore
 
 
 class _LoopThread:
@@ -110,14 +104,8 @@ class Stores:
 
     def __init__(self) -> None:
         pool = get_pool()
-        self.hypotheses = HypothesisStore(pool)
         self.transcript = TranscriptStore(pool)
         self.node_calls = NodeCallStore(pool)
-        self.concept_graph = ConceptGraph(pool)
-        self.learner_overlay = LearnerOverlay(pool)
-        self.revisions = WorldModelRevisionStore(pool)
-        self.branches = BranchStore(pool)
-        self.options = OptionStore(pool)
         self.diagnostics = TurnDiagnosticsStore(pool)
         self.learners = LearnerStore(pool)
         self.disambiguation = DisambiguationStore(pool)

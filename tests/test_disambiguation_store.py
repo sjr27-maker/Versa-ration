@@ -6,8 +6,8 @@ from probe.models import BranchStatus, DisambiguationBranch, Option, OptionStatu
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_create_turn_roundtrips(disambiguation_store, transcript, learner_id, concept_graph_id):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+async def test_create_turn_roundtrips(disambiguation_store, transcript, learner_id):
+    session_id = await transcript.create_session(learner_id)
     turn = await disambiguation_store.create_turn(
         session_id, 0, needs_branches=True, turn_had_direct_answer=False
     )
@@ -19,11 +19,11 @@ async def test_create_turn_roundtrips(disambiguation_store, transcript, learner_
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_a_turn_judged_unambiguous_is_still_a_queryable_row(
-    disambiguation_store, transcript, learner_id, concept_graph_id
+    disambiguation_store, transcript, learner_id
 ):
     """See DisambiguationTurn's docstring / CLAUDE.md invariant 9: a
     turn with zero branches is a fact, not a gap."""
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     turn = await disambiguation_store.create_turn(
         session_id, 0, needs_branches=False, turn_had_direct_answer=True
     )
@@ -37,9 +37,9 @@ async def test_a_turn_judged_unambiguous_is_still_a_queryable_row(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_add_branches_and_list_for_turn(
-    disambiguation_store, transcript, learner_id, concept_graph_id
+    disambiguation_store, transcript, learner_id
 ):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     turn = await disambiguation_store.create_turn(
         session_id, 0, needs_branches=True, turn_had_direct_answer=False
     )
@@ -64,9 +64,9 @@ async def test_add_branches_and_list_for_turn(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_mark_matched_and_supersede_open_branches(
-    disambiguation_store, transcript, learner_id, concept_graph_id
+    disambiguation_store, transcript, learner_id
 ):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     turn = await disambiguation_store.create_turn(
         session_id, 0, needs_branches=True, turn_had_direct_answer=False
     )
@@ -95,9 +95,9 @@ async def test_mark_matched_and_supersede_open_branches(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_options_roundtrip_and_click_resolve(
-    disambiguation_store, transcript, learner_id, concept_graph_id
+    disambiguation_store, transcript, learner_id
 ):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     turn = await disambiguation_store.create_turn(
         session_id, 0, needs_branches=True, turn_had_direct_answer=False
     )
@@ -127,9 +127,9 @@ async def test_options_roundtrip_and_click_resolve(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_supersede_open_options_leaves_selected_untouched(
-    disambiguation_store, transcript, learner_id, concept_graph_id
+    disambiguation_store, transcript, learner_id
 ):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     turn = await disambiguation_store.create_turn(
         session_id, 0, needs_branches=True, turn_had_direct_answer=False
     )

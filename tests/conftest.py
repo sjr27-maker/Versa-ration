@@ -5,18 +5,12 @@ import pytest
 import pytest_asyncio
 
 from probe.audit import NodeCallStore, TranscriptStore
-from probe.branches import BranchStore
-from probe.concept_graph import ConceptGraph
 from probe.db import create_pool
 from probe.diagnostics import TurnDiagnosticsStore
 from probe.disambiguate import DisambiguationStore
 from probe.embeddings import StubEmbeddingClient
 from probe.learner import LearnerStore
 from probe.memory import LearnerFactStore, ThinkingStyleStore
-from probe.options import OptionStore
-from probe.overlay import LearnerOverlay
-from probe.revision import WorldModelRevisionStore
-from probe.store import HypothesisStore
 
 DATABASE_URL = os.getenv(
     "PROBE_TEST_DATABASE_URL",
@@ -40,7 +34,10 @@ async def pool():
     async with pool.acquire() as conn:
         # Fresh schema for the test session. DROP is DDL cleanup here in
         # tests only — the stores themselves must never remove rows
-        # (CLAUDE.md invariants 1 and 2).
+        # (CLAUDE.md invariants). The list is deliberately still
+        # comprehensive (includes the tables migration 032 retires) so
+        # a run against a pre-032 schema is cleaned too; every DROP is
+        # IF EXISTS.
         await conn.execute("DROP TABLE IF EXISTS node_calls CASCADE")
         await conn.execute("DROP TABLE IF EXISTS turn_diagnostics CASCADE")
         await conn.execute("DROP TABLE IF EXISTS hypothesis_tier_changes CASCADE")
@@ -78,12 +75,9 @@ async def pool():
         # On a genuinely first-ever bootstrap (extension didn't exist
         # yet when this exact connection was created — see db.py's
         # _init_connection), the vector codec silently failed to
-        # register at connection-init time and this connection would
-        # otherwise sit in the pool "poisoned" (returning raw
-        # '[0.1,...]' strings instead of Python lists) for its whole
-        # lifetime. The migration just above this line is guaranteed
-        # to have created the extension, so it's always safe to
-        # register it now, before this connection goes back to the pool.
+        # register at connection-init time. The migrations just replayed
+        # are guaranteed to have created the extension, so register it
+        # now, before this connection goes back to the pool.
         from pgvector.asyncpg import register_vector
 
         await register_vector(conn)
@@ -97,21 +91,12 @@ async def pool():
 async def clean_pool(pool):
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE node_calls, turn_diagnostics, hypothesis_tier_changes, "
-            "turns, sessions, learners, evidence_refs, "
-            "hypotheses, learner_overlay, concept_prerequisites, concept_nodes, "
-            "concept_graphs, hypothesis_concepts, world_model_revisions, "
-            "world_model_revision_evidence, branches, branch_generations, "
-            "options, disambiguation_options, disambiguation_branches, "
-            "disambiguation_turns, learner_facts, thinking_style_candidates "
+            "TRUNCATE node_calls, turn_diagnostics, turns, sessions, learners, "
+            "disambiguation_options, disambiguation_branches, disambiguation_turns, "
+            "learner_facts, thinking_style_candidates "
             "RESTART IDENTITY CASCADE"
         )
     return pool
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def store(clean_pool):
-    return HypothesisStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -122,31 +107,6 @@ async def transcript(clean_pool):
 @pytest_asyncio.fixture(loop_scope="session")
 async def node_calls(clean_pool):
     return NodeCallStore(clean_pool)
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def concept_graph(clean_pool):
-    return ConceptGraph(clean_pool)
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def learner_overlay(clean_pool):
-    return LearnerOverlay(clean_pool)
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def revision_store(clean_pool):
-    return WorldModelRevisionStore(clean_pool)
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def branch_store(clean_pool):
-    return BranchStore(clean_pool)
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def option_store(clean_pool):
-    return OptionStore(clean_pool)
 
 
 @pytest_asyncio.fixture(loop_scope="session")
@@ -171,9 +131,9 @@ async def thinking_style_store(clean_pool):
 
 @pytest.fixture
 def embedding_client():
-    """A fresh StubEmbeddingClient per test — unlike the DB-backed
-    fixtures above, this holds no shared state worth reusing across
-    tests (just a `canned` dict and a `texts` log)."""
+    """A fresh StubEmbeddingClient per test — holds no shared state
+    worth reusing across tests (just a `canned` dict and a `texts`
+    log)."""
     return StubEmbeddingClient()
 
 
@@ -189,12 +149,3 @@ async def learner_id(learner_store):
     learner identity itself."""
     learner = await learner_store.create()
     return learner.id
-
-
-@pytest_asyncio.fixture(loop_scope="session")
-async def concept_graph_id(concept_graph):
-    """A fresh empty concept graph per test, for tests that just need
-    *a* valid concept_graph_id to satisfy sessions.concept_graph_id's
-    FK (or to add concepts into) and don't care about the topic."""
-    meta = await concept_graph.create_graph(topic="test-topic")
-    return meta.id

@@ -17,9 +17,9 @@ def _vec(*, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> list[float]:
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_add_and_list_by_learner_roundtrips(
-    learner_fact_store, transcript, learner_id, concept_graph_id
+    learner_fact_store, transcript, learner_id
 ):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     turn_id = await transcript.record_turn(session_id, 0, "can you help with derivatives")
     fact = LearnerFact(
         learner_id=learner_id,
@@ -43,9 +43,9 @@ async def test_add_and_list_by_learner_roundtrips(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_list_by_session_orders_by_turn_index(
-    learner_fact_store, transcript, learner_id, concept_graph_id
+    learner_fact_store, transcript, learner_id
 ):
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     for i, situation in enumerate(["first", "second", "third"]):
         turn_id = await transcript.record_turn(session_id, i, situation)
         await learner_fact_store.add(
@@ -61,15 +61,15 @@ async def test_list_by_session_orders_by_turn_index(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_search_similar_ranks_by_cosine_similarity_and_is_learner_scoped(
-    learner_fact_store, transcript, learner_store, learner_id, concept_graph_id
+    learner_fact_store, transcript, learner_store, learner_id
 ):
     """Three facts at controlled angles from the query vector -- the
     nearest one must come back first, with a similarity score that
     actually reflects the angle, and a second learner's fact (even one
     embedded identically to the query) must never appear."""
     other_learner_id = (await learner_store.create()).id
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
-    other_session_id = await transcript.create_session(other_learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
+    other_session_id = await transcript.create_session(other_learner_id)
 
     near_turn = await transcript.record_turn(session_id, 0, "near")
     far_turn = await transcript.record_turn(session_id, 1, "far")

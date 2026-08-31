@@ -1,8 +1,6 @@
 """SessionLoop wiring for the memory layer (memory.py), on top of
-ReasoningMode.DISAMBIGUATE — node-level parsing is covered by
-test_disambiguate_nodes.py/(memory nodes have none of their own yet,
-parsing is exercised here at the loop level), raw store CRUD by
-test_memory_store.py.
+SessionMode.MINIMAL_BRANCH — raw store CRUD is covered by
+test_memory_store.py; this exercises the loop-level wiring.
 """
 
 import json
@@ -10,7 +8,6 @@ from uuid import uuid4
 
 import pytest
 
-from probe.ablation import AblationConfig, ReasoningMode
 from probe.embeddings import EMBEDDING_DIM
 from probe.llm import StubLLMClient
 from probe.loop import SessionLoop
@@ -34,20 +31,14 @@ def _vec(x: float = 0.0) -> list[float]:
 
 
 def _make_loop(
-    store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-    disambiguation_store, llm=None, diagnostics_store=None,
+    transcript, node_calls, disambiguation_store, llm=None, diagnostics_store=None,
     learner_fact_store=None, thinking_style_store=None, embedding_client=None,
 ):
     return SessionLoop(
-        hypothesis_store=store,
         transcript=transcript,
         node_calls=node_calls,
-        concept_graph=concept_graph,
-        learner_overlay=learner_overlay,
-        revision_store=revision_store,
         llm=llm or StubLLMClient(),
         diagnostics_store=diagnostics_store,
-        ablation_config=AblationConfig(reasoning_mode=ReasoningMode.DISAMBIGUATE),
         disambiguation_store=disambiguation_store,
         learner_fact_store=learner_fact_store,
         thinking_style_store=thinking_style_store,
@@ -57,8 +48,7 @@ def _make_loop(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_fact_written_for_a_direct_answer_turn(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, learner_fact_store, embedding_client,
 ):
     llm = StubLLMClient(
@@ -70,10 +60,10 @@ async def test_fact_written_for_a_direct_answer_turn(
             ),
         }
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         learner_fact_store=learner_fact_store, embedding_client=embedding_client,
     )
 
@@ -91,8 +81,7 @@ async def test_fact_written_for_a_direct_answer_turn(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_fact_written_for_a_branch_resolution_turn(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, learner_fact_store, embedding_client,
 ):
     async def _options_after_branches(prompt: str) -> str:
@@ -112,7 +101,7 @@ async def test_fact_written_for_a_branch_resolution_turn(
                 return await _options_after_branches(prompt)
             return await super().complete(prompt)
 
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     llm = _AsyncCannedLLM(
         canned={
             "ASSESS:BRANCH": _TWO_BRANCHES,
@@ -124,8 +113,8 @@ async def test_fact_written_for_a_branch_resolution_turn(
         }
     )
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         learner_fact_store=learner_fact_store, embedding_client=embedding_client,
     )
 
@@ -150,13 +139,12 @@ async def test_fact_written_for_a_branch_resolution_turn(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_options_only_turn_writes_no_fact(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, learner_fact_store, embedding_client,
 ):
     """A turn that only raises options (nothing resolved yet) must not
     write a fact -- see WriteLearnerFact's docstring."""
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
 
     async def _options_after_branches(prompt: str) -> str:
         latest = await disambiguation_store.get_latest_turn(session_id)
@@ -177,8 +165,8 @@ async def test_options_only_turn_writes_no_fact(
 
     llm = _AsyncCannedLLM(canned={"ASSESS:BRANCH": _TWO_BRANCHES})
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         learner_fact_store=learner_fact_store, embedding_client=embedding_client,
     )
     await loop.handle_turn(session_id, 0, "can you help with derivatives?")
@@ -186,10 +174,9 @@ async def test_options_only_turn_writes_no_fact(
 
 
 async def _seed_matching_fact(
-    learner_fact_store, transcript, embedding_client, learner_id, concept_graph_id,
-    message_text: str,
+    learner_fact_store, transcript, embedding_client, learner_id, message_text: str,
 ):
-    seed_session_id = await transcript.create_session(learner_id, concept_graph_id)
+    seed_session_id = await transcript.create_session(learner_id)
     turn_id = await transcript.record_turn(seed_session_id, 0, "an earlier message")
     shared_vector = _vec(1.0)
     fact = await learner_fact_store.add(
@@ -207,30 +194,25 @@ async def _seed_matching_fact(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_memory_pre_check_skips_branching_when_confirmed(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, learner_fact_store, embedding_client,
 ):
     message = "which rule applies here again?"
     fact = await _seed_matching_fact(
-        learner_fact_store, transcript, embedding_client, learner_id, concept_graph_id, message
+        learner_fact_store, transcript, embedding_client, learner_id, message
     )
     llm = StubLLMClient(
         canned={
-            # A trap: if AssessAndBranch is called at all, this would
-            # show up as a needs_branches=True turn -- the test fails
-            # loudly (branches persisted) instead of just silently
-            # passing for the wrong reason.
-            "ASSESS:BRANCH": _TWO_BRANCHES,
+            "ASSESS:BRANCH": _TWO_BRANCHES,  # a trap: must never be called
             "CONFIRM:FACT_MATCH": json.dumps({"resolves": True}),
             "FINAL:ANSWER": "answer using the remembered fact",
             "WRITE:FACT": json.dumps({"situation": "s", "resolution": "r"}),
         }
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         learner_fact_store=learner_fact_store, embedding_client=embedding_client,
     )
 
@@ -254,13 +236,12 @@ async def test_memory_pre_check_skips_branching_when_confirmed(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_memory_pre_check_proceeds_normally_when_not_confirmed(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, learner_fact_store, embedding_client,
 ):
     message = "which rule applies here again?"
     await _seed_matching_fact(
-        learner_fact_store, transcript, embedding_client, learner_id, concept_graph_id, message
+        learner_fact_store, transcript, embedding_client, learner_id, message
     )
     llm = StubLLMClient(
         canned={
@@ -270,10 +251,10 @@ async def test_memory_pre_check_proceeds_normally_when_not_confirmed(
             "WRITE:FACT": json.dumps({"situation": "s", "resolution": "r"}),
         }
     )
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         learner_fact_store=learner_fact_store, embedding_client=embedding_client,
     )
 
@@ -290,18 +271,16 @@ async def test_memory_pre_check_proceeds_normally_when_not_confirmed(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_no_memory_stores_configured_behaves_exactly_as_before(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store,
 ):
     """Backward compatibility: omitting learner_fact_store/embedding_client
-    (as every disambiguation test predating the memory layer does) must
-    not touch learner_facts or crash."""
+    must not touch learner_facts or crash."""
     llm = StubLLMClient(canned={"ASSESS:BRANCH": _NOT_AMBIGUOUS, "FINAL:ANSWER": "answer"})
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
     )
     message = await loop.handle_turn(session_id, 0, "what is a derivative?")
     assert message == "answer"
@@ -312,13 +291,12 @@ async def test_no_memory_stores_configured_behaves_exactly_as_before(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_thinking_style_only_increments_on_explicit_confirmation(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     learner_fact_store, thinking_style_store, embedding_client,
 ):
     """consolidate_session must never grow confirmation_count/session_ids
     off similarity alone -- only CONFIRM:THINKING_STYLE saying yes."""
-    session_a = await transcript.create_session(learner_id, concept_graph_id)
+    session_a = await transcript.create_session(learner_id)
     turn_a = await transcript.record_turn(session_a, 0, "turn a")
     await learner_fact_store.add(
         LearnerFact(
@@ -340,16 +318,13 @@ async def test_thinking_style_only_increments_on_explicit_confirmation(
         }
     )
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, learner_fact_store=learner_fact_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        learner_fact_store=learner_fact_store,
         thinking_style_store=thinking_style_store, embedding_client=embedding_client,
     )
 
     result = await loop.consolidate_session(session_a)
 
-    # Not confirmed -- the existing candidate must be untouched, and a
-    # brand new candidate created instead of silently reusing the
-    # near-identical vector match.
     unchanged = await thinking_style_store.get(existing.id)
     assert unchanged.confirmation_count == 1
     assert unchanged.session_ids == existing.session_ids
@@ -359,11 +334,10 @@ async def test_thinking_style_only_increments_on_explicit_confirmation(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_thinking_style_confirms_and_grows_when_llm_agrees(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     learner_fact_store, thinking_style_store, embedding_client,
 ):
-    session_a = await transcript.create_session(learner_id, concept_graph_id)
+    session_a = await transcript.create_session(learner_id)
     turn_a = await transcript.record_turn(session_a, 0, "turn a")
     await learner_fact_store.add(
         LearnerFact(
@@ -385,8 +359,8 @@ async def test_thinking_style_confirms_and_grows_when_llm_agrees(
         }
     )
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, learner_fact_store=learner_fact_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        learner_fact_store=learner_fact_store,
         thinking_style_store=thinking_style_store, embedding_client=embedding_client,
     )
 
@@ -398,24 +372,24 @@ async def test_thinking_style_confirms_and_grows_when_llm_agrees(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_candidate_below_threshold_never_appears_in_a_live_prompt(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, thinking_style_store,
 ):
     below_threshold = await thinking_style_store.create_candidate(
         learner_id, uuid4(), "wants a concrete example before any abstract rule", _vec(1.0)
     )
-    for sid in [uuid4(), uuid4()]:  # 2 more confirmations -- count=3, still below default 5
+    for sid in [uuid4(), uuid4()]:  # count=3, still below default 5
         below_threshold = await thinking_style_store.confirm(
-            below_threshold.id, sid, promotion_threshold=MemoryConfig().thinking_style_promotion_threshold
+            below_threshold.id, sid,
+            promotion_threshold=MemoryConfig().thinking_style_promotion_threshold,
         )
     assert below_threshold.confirmation_count == 3
 
     llm = StubLLMClient(canned={"ASSESS:BRANCH": _NOT_AMBIGUOUS, "FINAL:ANSWER": "answer"})
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         thinking_style_store=thinking_style_store,
     )
 
@@ -428,24 +402,24 @@ async def test_candidate_below_threshold_never_appears_in_a_live_prompt(
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_promoted_candidate_appears_in_the_live_prompt(
-    store, transcript, node_calls, clean_pool, learner_id, concept_graph_id,
-    concept_graph, learner_overlay, revision_store, disambiguation_store,
+    transcript, node_calls, clean_pool, learner_id, disambiguation_store,
     diagnostics_store, thinking_style_store,
 ):
     promoted = await thinking_style_store.create_candidate(
         learner_id, uuid4(), "wants a concrete example before any abstract rule", _vec(1.0)
     )
-    for sid in [uuid4(), uuid4(), uuid4(), uuid4()]:  # count reaches 5, the default threshold
+    for sid in [uuid4(), uuid4(), uuid4(), uuid4()]:  # count reaches 5
         promoted = await thinking_style_store.confirm(
-            promoted.id, sid, promotion_threshold=MemoryConfig().thinking_style_promotion_threshold
+            promoted.id, sid,
+            promotion_threshold=MemoryConfig().thinking_style_promotion_threshold,
         )
     assert promoted.confirmation_count == 5
 
     llm = StubLLMClient(canned={"ASSESS:BRANCH": _NOT_AMBIGUOUS, "FINAL:ANSWER": "answer"})
-    session_id = await transcript.create_session(learner_id, concept_graph_id)
+    session_id = await transcript.create_session(learner_id)
     loop = _make_loop(
-        store, transcript, node_calls, concept_graph, learner_overlay, revision_store,
-        disambiguation_store, llm=llm, diagnostics_store=diagnostics_store,
+        transcript, node_calls, disambiguation_store, llm=llm,
+        diagnostics_store=diagnostics_store,
         thinking_style_store=thinking_style_store,
     )
 

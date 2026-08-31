@@ -39,8 +39,9 @@ facts = run_async(stores.learner_facts.list_by_learner(learner.id))
 if not facts:
     st.info(
         "No facts recorded yet — this learner has no minimal_branch "
-        "(ReasoningMode.DISAMBIGUATE) turns that resolved something, or "
-        "the memory layer wasn't configured for those sessions."
+        "turns that resolved something (a BASELINE session, or one that "
+        "only ever raised options), or the memory layer wasn't "
+        "configured for those sessions."
     )
     st.stop()
 

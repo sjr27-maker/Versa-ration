@@ -3,14 +3,16 @@
 Three tiers exist purely as a cost/quality knob over which concrete
 Gemini model answers a node's calls — not something nodes know or care
 about. Every node still just calls `llm.complete(prompt)`; which tier's
-client it was constructed with is decided once, in SessionLoop (and in
-cli.py for the standalone seed_graph call), never per-call.
+client it was constructed with is decided once, in SessionLoop, never
+per-call.
 
 Tier -> node assignment (fixed by agreement, not derived from anything
 in this file):
-    fast:     Infer, GroundConcept, MismatchDetector, ValueFunction terms
-    capable:  Plan's proposer, seed_graph
-    best:     Teach
+    fast:     AssessAndBranch, DisambiguationOptions, the memory-layer
+              judgment nodes (ConfirmFactMatch, WriteLearnerFact,
+              SummarizeSessionPath, ConfirmThinkingStyleMatch)
+    capable:  (unused since the full reasoning path was removed)
+    best:     FinalAnswer, BaselineTeach
 
 Model ids below are pinned to flash-class models across all three
 tiers as of 2026-08, verified live against a real key (see the

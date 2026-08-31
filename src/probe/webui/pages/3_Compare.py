@@ -63,40 +63,21 @@ config_a = run_async(stores.transcript.get_ablation_config(session_a.session_id)
 config_b = run_async(stores.transcript.get_ablation_config(session_b.session_id))
 
 st.header("1. Config")
-_fields = [
-    "enable_portrait",
-    "enable_concept_graph",
-    "enable_diagnose",
-    "enable_planner",
-    "enable_branches",
-    "enable_options",
-    "enable_exploration_slot",
-    "reasoning_budget_mode",
-]
-
-
-def _display(value: object) -> str:
-    # Always a string: this column mixes booleans (the enable_* flags)
-    # with an enum value (reasoning_budget_mode) row to row, which
-    # pandas/pyarrow can't give one consistent dtype -- st.dataframe
-    # silently "fixes" it with a scary traceback logged underneath,
-    # rather than erroring, so this is worth avoiding outright.
-    return str(value.value if hasattr(value, "value") else value)
-
-
-config_rows = []
-for field in _fields:
-    value_a = getattr(config_a, field)
-    value_b = getattr(config_b, field)
-    config_rows.append(
+# Only one field left after the full reasoning path was removed: which
+# of the two remaining architectures (minimal_branch / baseline) ran.
+mode_a = config_a.mode.value
+mode_b = config_b.mode.value
+st.dataframe(
+    [
         {
-            "field": field,
-            "A": _display(value_a),
-            "B": _display(value_b),
-            "differs": "⚠ differs" if value_a != value_b else "",
+            "field": "mode",
+            "A": mode_a,
+            "B": mode_b,
+            "differs": "⚠ differs" if mode_a != mode_b else "",
         }
-    )
-st.dataframe(config_rows, hide_index=True)
+    ],
+    hide_index=True,
+)
 
 st.header("2. Per-turn cost")
 
@@ -137,10 +118,11 @@ st.header("3. Transcripts, aligned turn by turn")
 
 
 def _tutor_message(session_id, turn_index) -> str | None:
-    # A BASELINE turn's response lives under "BaselineTeach", not
-    # "Teach" (see loop.py's _handle_bypass_turn) — check both so this
-    # page doesn't quietly show blank tutor turns for a baseline session.
-    for node_name in ("Teach", "BaselineTeach"):
+    # A minimal_branch turn's response lives under "FinalAnswer", a
+    # BASELINE turn's under "BaselineTeach" — check both so this page
+    # doesn't quietly show blank tutor turns. A "show options" turn has
+    # neither (nothing answered yet).
+    for node_name in ("FinalAnswer", "BaselineTeach"):
         call = run_async(stores.node_calls.get_call_for_turn(session_id, turn_index, node_name))
         if call is not None:
             return str(call.output_json)

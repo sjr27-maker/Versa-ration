@@ -53,30 +53,22 @@ class TranscriptStore:
     async def create_session(
         self,
         learner_id: UUID,
-        concept_graph_id: UUID | None = None,
         session_id: UUID | None = None,
         ablation_config: AblationConfig | None = None,
     ) -> UUID:
-        # concept_graph_id is nullable as of migration 013: a session
-        # created with no topic yet (web UI's "no topic input" setup)
-        # gets one attached by AttachTopic on its first turn instead —
-        # SessionLoop.handle_turn hard-fails on any turn past the
-        # first if it's still null by then.
-        #
         # ablation_config is fixed for the session's lifetime (see
         # set_ablation_config's raise-if-turns-exist guard below) — None
-        # here means "full system," stored as SQL NULL rather than a
-        # serialized AblationConfig() so get_ablation_config's default
+        # here is stored as SQL NULL rather than a serialized
+        # AblationConfig() so get_ablation_config's default
         # interpretation stays the single source of truth for what NULL
         # means, not duplicated into every INSERT.
         session_id = session_id or uuid4()
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO sessions (id, learner_id, concept_graph_id, ablation_config) "
-                "VALUES ($1, $2, $3, $4)",
+                "INSERT INTO sessions (id, learner_id, ablation_config) "
+                "VALUES ($1, $2, $3)",
                 session_id,
                 learner_id,
-                concept_graph_id,
                 ablation_config.model_dump(mode="json") if ablation_config else None,
             )
         return session_id
@@ -84,8 +76,8 @@ class TranscriptStore:
     async def get_ablation_config(self, session_id: UUID) -> AblationConfig:
         """The AblationConfig a session was created with — NULL (never
         set, or created before migration 025) is interpreted as
-        `AblationConfig()`'s full-system default, which is exactly what
-        every such session actually runs with."""
+        `AblationConfig()`'s default, which is now `SessionMode.
+        MINIMAL_BRANCH`."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT ablation_config FROM sessions WHERE id = $1", session_id
@@ -140,55 +132,6 @@ class TranscriptStore:
             raise KeyError(f"session {session_id} not found")
         return learner_id
 
-    async def get_concept_graph_id(self, session_id: UUID) -> UUID | None:
-        """The concept graph this session is teaching — set once, by
-        AttachTopic on the session's first turn, same lookup pattern as
-        `get_learner_id`. This is how Diagnose/GroundConcept get "this
-        session's linked graph" without it being threaded as separate
-        call state.
-
-        Returns None for a session that hasn't had a topic attached
-        yet (nullable as of migration 013) — distinct from the session
-        not existing at all, which still raises KeyError. Diagnose
-        already degrades gracefully against a None graph (empty
-        candidate list, same as its existing "no concepts found" path)
-        so this doesn't require any change on that side.
-        """
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT concept_graph_id FROM sessions WHERE id = $1", session_id
-            )
-        if row is None:
-            raise KeyError(f"session {session_id} not found")
-        return row["concept_graph_id"]
-
-    async def attach_concept_graph_id(
-        self, session_id: UUID, concept_graph_id: UUID
-    ) -> None:
-        """Set once, by AttachTopic on a session's first turn. Raises
-        if the session already has one — a session's graph, once
-        attached, is set for its lifetime (same "set once at creation"
-        spirit as learner_id, just attached a turn later instead of at
-        INSERT time)."""
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT concept_graph_id FROM sessions WHERE id = $1 FOR UPDATE",
-                    session_id,
-                )
-                if row is None:
-                    raise KeyError(f"session {session_id} not found")
-                if row["concept_graph_id"] is not None:
-                    raise ValueError(
-                        f"session {session_id} already has concept_graph_id "
-                        f"{row['concept_graph_id']} attached"
-                    )
-                await conn.execute(
-                    "UPDATE sessions SET concept_graph_id = $2 WHERE id = $1",
-                    session_id,
-                    concept_graph_id,
-                )
-
     async def get_turn(self, turn_id: UUID) -> TurnRecord | None:
         """One turn by id — for showing an evidence ref's actual source
         text, not just its turn_id."""
@@ -203,23 +146,21 @@ class TranscriptStore:
     async def list_sessions_for_learner(
         self, learner_id: UUID
     ) -> list[SessionSummary]:
-        """A learner's sessions, most recent first, each with its
-        inferred topic (None if a topic was never attached) and turn
-        count — for the Setup page's read-only resume view."""
+        """A learner's sessions, most recent first, each with its turn
+        count — for the Setup page's read-only resume view.
+        `SessionSummary.topic` is always None now that sessions have no
+        concept graph attached."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 SELECT
                     s.id AS session_id,
-                    s.concept_graph_id,
-                    cg.topic AS topic,
                     s.created_at,
                     count(t.id) AS turn_count
                 FROM sessions s
-                LEFT JOIN concept_graphs cg ON cg.id = s.concept_graph_id
                 LEFT JOIN turns t ON t.session_id = s.id
                 WHERE s.learner_id = $1
-                GROUP BY s.id, s.concept_graph_id, cg.topic, s.created_at
+                GROUP BY s.id, s.created_at
                 ORDER BY s.created_at DESC
                 """,
                 learner_id,
@@ -227,8 +168,6 @@ class TranscriptStore:
         return [
             SessionSummary(
                 session_id=row["session_id"],
-                concept_graph_id=row["concept_graph_id"],
-                topic=row["topic"],
                 turn_count=row["turn_count"],
                 created_at=row["created_at"],
             )

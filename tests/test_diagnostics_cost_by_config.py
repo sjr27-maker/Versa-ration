@@ -1,13 +1,14 @@
 """TurnDiagnosticsStore.mean_cost_by_config -- the number that answers
 "what does this config cost," grouped across sessions by identical
-AblationConfig, with a NULL (never-set) session config bucketed
-together with an explicit full-system one rather than split out."""
+AblationConfig (i.e. the same SessionMode), with a NULL (never-set)
+session config bucketed together with an explicit default one rather
+than split out."""
 
 from __future__ import annotations
 
 import pytest
 
-from probe.ablation import AblationConfig, AblationPreset, build_preset
+from probe.ablation import AblationConfig, SessionMode
 from probe.models import TurnDiagnostics
 
 
@@ -30,21 +31,21 @@ async def _record(diagnostics_store, session_id, turn_index, duration_ms, calls,
 
 @pytest.mark.asyncio(loop_scope="session")
 async def test_groups_by_config_and_averages_correctly(
-    transcript, diagnostics_store, clean_pool, learner_id, concept_graph_id
+    transcript, diagnostics_store, clean_pool, learner_id
 ):
-    baseline_config = build_preset(AblationPreset.BASELINE)
-    full_config = AblationConfig()
+    baseline_config = AblationConfig(mode=SessionMode.BASELINE)
+    minimal_config = AblationConfig()  # SessionMode.MINIMAL_BRANCH
 
     baseline_session = await transcript.create_session(
-        learner_id, concept_graph_id, ablation_config=baseline_config
+        learner_id, ablation_config=baseline_config
     )
-    full_session = await transcript.create_session(
-        learner_id, concept_graph_id, ablation_config=full_config
+    minimal_session = await transcript.create_session(
+        learner_id, ablation_config=minimal_config
     )
 
     await _record(diagnostics_store, baseline_session, 0, duration_ms=1000.0, calls=1)
     await _record(diagnostics_store, baseline_session, 1, duration_ms=2000.0, calls=1)
-    await _record(diagnostics_store, full_session, 0, duration_ms=30000.0, calls=10)
+    await _record(diagnostics_store, minimal_session, 0, duration_ms=3000.0, calls=5)
 
     summaries = await diagnostics_store.mean_cost_by_config()
     by_config = {s.ablation_config.model_dump_json(): s for s in summaries}
@@ -54,23 +55,22 @@ async def test_groups_by_config_and_averages_correctly(
     assert baseline_summary.mean_duration_ms == pytest.approx(1500.0)
     assert baseline_summary.mean_call_count == pytest.approx(1.0)
 
-    full_summary = by_config[full_config.model_dump_json()]
-    assert full_summary.turn_count == 1
-    assert full_summary.mean_duration_ms == pytest.approx(30000.0)
-    assert full_summary.mean_call_count == pytest.approx(10.0)
+    minimal_summary = by_config[minimal_config.model_dump_json()]
+    assert minimal_summary.turn_count == 1
+    assert minimal_summary.mean_call_count == pytest.approx(5.0)
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_null_session_config_buckets_with_explicit_full_config(
-    transcript, diagnostics_store, clean_pool, learner_id, concept_graph_id
+async def test_null_session_config_buckets_with_explicit_default_config(
+    transcript, diagnostics_store, clean_pool, learner_id
 ):
-    null_config_session = await transcript.create_session(learner_id, concept_graph_id)
-    explicit_full_session = await transcript.create_session(
-        learner_id, concept_graph_id, ablation_config=AblationConfig()
+    null_config_session = await transcript.create_session(learner_id)
+    explicit_session = await transcript.create_session(
+        learner_id, ablation_config=AblationConfig()
     )
 
     await _record(diagnostics_store, null_config_session, 0, duration_ms=100.0, calls=5)
-    await _record(diagnostics_store, explicit_full_session, 0, duration_ms=300.0, calls=15)
+    await _record(diagnostics_store, explicit_session, 0, duration_ms=300.0, calls=15)
 
     summaries = await diagnostics_store.mean_cost_by_config()
 

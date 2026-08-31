@@ -34,15 +34,10 @@ class TurnDiagnosticsStore:
                 INSERT INTO turn_diagnostics (
                     id, session_id, turn_index, node_call_counts,
                     total_call_count, guardrail_fired, entropy_bits,
-                    duration_ms, warnings, teach_failed, inferred_topic,
-                    topic_seeded_new, retry_count, options_missed,
-                    current_belief_unsupported, generation_skipped_reason,
-                    explicit_request_present, explicit_request_what,
-                    explicit_request_unaddressed, prior_reference_detected,
-                    prior_reference_unaddressed, memory_match_found,
-                    memory_match_confirmed_resolution, branching_skipped_by_memory,
-                    matched_fact_id, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+                    duration_ms, warnings, teach_failed, retry_count,
+                    memory_match_found, memory_match_confirmed_resolution,
+                    branching_skipped_by_memory, matched_fact_id, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                 """,
                 diagnostics.id,
                 diagnostics.session_id,
@@ -54,17 +49,7 @@ class TurnDiagnosticsStore:
                 diagnostics.duration_ms,
                 diagnostics.warnings,
                 diagnostics.teach_failed,
-                diagnostics.inferred_topic,
-                diagnostics.topic_seeded_new,
                 diagnostics.retry_count,
-                diagnostics.options_missed,
-                diagnostics.current_belief_unsupported,
-                diagnostics.generation_skipped_reason,
-                diagnostics.explicit_request_present,
-                diagnostics.explicit_request_what,
-                diagnostics.explicit_request_unaddressed,
-                diagnostics.prior_reference_detected,
-                diagnostics.prior_reference_unaddressed,
                 diagnostics.memory_match_found,
                 diagnostics.memory_match_confirmed_resolution,
                 diagnostics.branching_skipped_by_memory,
